@@ -9,6 +9,8 @@
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::sync::Lock;
+
 const PL011_BASE: usize = 0x0900_0000;
 
 // Register offsets from the PL011 technical reference manual.
@@ -93,10 +95,7 @@ impl Uart {
     }
 }
 
-// Implemented on `&Uart` rather than `Uart` so the console can be a plain
-// `static` instead of a `static mut`. A `Uart` owns no state, only the address
-// of the hardware, so a shared reference is enough to drive it.
-impl fmt::Write for &Uart {
+impl fmt::Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             // Terminals want CRLF; Rust gives us bare LF.
@@ -111,19 +110,22 @@ impl fmt::Write for &Uart {
 
 /// The console every `print!` in the kernel goes through.
 ///
-/// Unsynchronised. Single core, no interrupts, no preemption yet, so nothing
-/// can interleave a write today. This needs a real lock the moment tier 1
-/// turns on the timer interrupt.
-static CONSOLE: Uart = unsafe { Uart::new(PL011_BASE) };
+/// Locked, because a `println!` is many separate writes to the data register
+/// and an interrupt landing partway through would splice its own output into
+/// the middle of the line. Garbled output during interrupt bring-up is worse
+/// than no output: it makes you distrust the one instrument you have.
+static CONSOLE: Lock<Uart> = Lock::new(unsafe { Uart::new(PL011_BASE) });
 
 pub fn init() {
-    CONSOLE.init();
+    CONSOLE.lock().init();
 }
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    let _ = (&CONSOLE).write_fmt(args);
+    // One lock for the whole format operation, not one per byte. The point is
+    // that the entire line lands without interruption.
+    let _ = CONSOLE.lock().write_fmt(args);
 }
 
 #[macro_export]

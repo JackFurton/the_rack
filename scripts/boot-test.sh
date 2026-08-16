@@ -28,6 +28,7 @@ EXPECTED=(
     # restore paths are broken it hangs or faults instead of reaching here.
     "class  : BRK instruction"
     "trap self test: resumed"
+    "lock self test: passed"
     "tier 0 complete"
 )
 
