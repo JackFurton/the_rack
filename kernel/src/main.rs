@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+pub mod exceptions;
 pub mod semihosting;
 pub mod uart;
 
@@ -12,6 +13,7 @@ use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 global_asm!(include_str!("boot.S"));
+global_asm!(include_str!("vectors.S"));
 
 unsafe extern "C" {
     static __kernel_end: u8;
@@ -21,6 +23,10 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
     uart::init();
+
+    // Before anything else that could fault. Until VBAR_EL1 is set, a fault
+    // produces silence rather than a report.
+    exceptions::init();
 
     println!();
     println!("the_rack {}", env!("CARGO_PKG_VERSION"));
@@ -32,8 +38,14 @@ pub extern "C" fn kernel_main() -> ! {
         "  kernel end      : {:#018x}",
         &raw const __kernel_end as usize
     );
+    println!("  vector table    : {:#018x}", exceptions::vector_base());
+    println!();
+
+    exceptions::self_test();
+
     println!();
     println!("tier 0 complete. we are alive on bare metal.");
+    println!("tier 1: exception vectors online.");
 
     halt()
 }
