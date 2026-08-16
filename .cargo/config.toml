@@ -1,0 +1,23 @@
+# Softfloat, not plain `aarch64-unknown-none`.
+#
+# At reset CPACR_EL1.FPEN is 0, so any FP or SIMD instruction at EL1 traps.
+# Rather than enable FP for the kernel, we compile the kernel so it never
+# emits an FP instruction in the first place. Kernel code that avoids FP does
+# not have to save and restore 512 bytes of vector state on every context
+# switch, which is what we want by the time tier 2 has a scheduler. FP stays
+# trapped and belongs to userspace.
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+# `cargo run` boots the kernel on the QEMU virt machine and wires its UART to
+# this terminal. Ctrl-A then X quits.
+runner = [
+    "qemu-system-aarch64",
+    "-machine", "virt",
+    "-cpu", "cortex-a72",
+    "-m", "256M",
+    "-nographic",
+    "-semihosting-config", "enable=on,target=native",
+    "-kernel",
+]

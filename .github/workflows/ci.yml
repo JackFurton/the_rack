@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  boot:
+    name: builds and boots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the bare metal target
+        run: rustup target add aarch64-unknown-none-softfloat
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm
+
+      - name: Build
+        run: cargo build
+
+      - name: Boot under QEMU
+        run: scripts/boot-test.sh
+
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    # Advisory only. Style nits should never be the thing standing between you
+    # and merging a change you were enjoying. The boot job is the real gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the bare metal target
+        run: rustup target add aarch64-unknown-none-softfloat
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # No --all-targets: the test harness needs the `test` crate, which does
+      # not exist for a bare metal target.
+      - name: Clippy
+        run: cargo clippy -- -D warnings
