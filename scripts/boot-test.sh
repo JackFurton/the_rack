@@ -30,7 +30,18 @@ EXPECTED=(
     "trap self test: resumed"
     "lock self test: passed"
     "tier 0 complete"
+    "heartbeat started"
+    # Exact tick counts, not just "some output happened". Reaching 200 ticks
+    # means 200 timer interrupts were raised, forwarded by the GIC, claimed,
+    # dispatched, and acknowledged. A missing EOI or a dropped re-arm shows up
+    # here as the counter stalling.
+    "uptime 1s (100 ticks)"
+    "uptime 2s (200 ticks)"
 )
+
+# The run is not finished until the machine has proved it keeps running on its
+# own, so wait for the second heartbeat rather than the last banner line.
+READY_MARKER="uptime 2s"
 
 # Strings that fail the run no matter what else showed up. Reaching the banner
 # is not enough if the kernel fell over immediately afterwards.
@@ -105,7 +116,7 @@ for _ in $(seq $((TIMEOUT * 10))); do
         if [ "$settle" -ge "$SETTLE_TICKS" ]; then
             break
         fi
-    elif grep -qF "tier 0 complete" "$LOG" 2>/dev/null; then
+    elif grep -qF "$READY_MARKER" "$LOG" 2>/dev/null; then
         booted=1
     fi
 

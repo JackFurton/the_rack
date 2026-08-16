@@ -68,6 +68,11 @@ impl VectorIndex {
             .copied()
             .unwrap_or("unknown kind")
     }
+
+    /// IRQ is the second entry in every group.
+    pub fn is_irq(&self) -> bool {
+        self.0 & 0b11 == 1
+    }
 }
 
 impl fmt::Display for VectorIndex {
@@ -206,6 +211,15 @@ pub fn vector_base() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     let index = VectorIndex(index);
+
+    // Interrupts are routine and carry no syndrome: ESR is not meaningful for
+    // an IRQ, and printing a report for each one at 100 Hz would bury
+    // everything else.
+    if index.is_irq() {
+        dispatch_irq();
+        return;
+    }
+
     let syndrome = Syndrome(frame.esr);
 
     report(frame, index, syndrome);
@@ -224,6 +238,29 @@ pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     // Everything else is unexpected. Nothing here knows how to recover, and
     // returning would just re-run the faulting instruction and trap forever.
     panic!("unhandled exception: {}", syndrome.class_name());
+}
+
+/// Claim an interrupt from the GIC, route it, and release it.
+///
+/// The acknowledge and the end-of-interrupt have to bracket the handler
+/// exactly once each. Skipping the EOI gets you precisely one interrupt: the
+/// controller keeps it active and refuses to deliver anything of equal or
+/// lower priority afterwards, which looks like the timer having stopped.
+fn dispatch_irq() {
+    let intid = crate::gic::acknowledge();
+
+    // The GIC can withdraw an interrupt between raising it and our claiming
+    // it, in which case it hands back the spurious ID and expects no EOI.
+    if intid == crate::gic::SPURIOUS_INTID {
+        return;
+    }
+
+    match intid {
+        crate::timer::TIMER_INTID => crate::timer::on_tick(),
+        other => println!("unhandled IRQ {other}"),
+    }
+
+    crate::gic::end_of_interrupt(intid);
 }
 
 fn report(frame: &TrapFrame, index: VectorIndex, syndrome: Syndrome) {
