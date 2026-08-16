@@ -38,9 +38,20 @@ trap self test: resumed, registers intact
 lock self test: unlocked=false locked=true nested=true released=false
 lock self test: passed, guarded counter reached 1
 
+gic: 288 interrupt lines
+timer: 62500000 Hz counter, tick every 10 ms
+
 tier 0 complete. we are alive on bare metal.
 tier 1: exception vectors online.
+tier 1: heartbeat started, interrupts live.
+
+uptime 1s (100 ticks)
+uptime 2s (200 ticks)
+uptime 3s (300 ticks)
 ```
+
+From `heartbeat started` onwards the machine is running on its own. It sits in
+`wfi` and wakes 100 times a second on a timer interrupt, at around 1% host CPU.
 
 The trap self test is not decoration. It executes a real `brk`, which traps
 into the vector table, builds a register frame, decodes the syndrome, steps the
@@ -104,6 +115,16 @@ trapped and belongs to userspace.
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
 
+**Why the timer re-arms with CVAL, not TVAL.** `CNTP_TVAL_EL0` is a countdown
+from the moment it is written, so re-arming with it makes every period
+`interval + however long it took to reach the handler`. That latency compounds
+on every tick: measured against wall clock, a TVAL re-arm at 100 Hz ran 25%
+slow in a debug build under TCG. `CNTP_CVAL_EL0` is an absolute deadline, so
+anchoring the next one to the previous deadline means handler latency has to
+exceed a whole interval before it costs anything. Measured gap is now a
+constant 1 second of startup at both 12 and 24 seconds of runtime, with no
+accumulation.
+
 **Why the console lock is not a spinlock.** Rust's atomics compile to
 `LDXR`/`STXR`, which depend on the exclusive monitor, and the architecture only
 guarantees that works for Normal cacheable memory. With the MMU off every
@@ -127,6 +148,8 @@ kernel/
     uart.rs       PL011 driver and the print!/println! macros
     exceptions.rs trap frame layout, ESR decoding, handler policy
     sync.rs       interrupt masking and the console lock
+    gic.rs        GICv2 distributor and CPU interface
+    timer.rs      generic timer, the 100 Hz heartbeat
     semihosting.rs asking QEMU to shut the machine down
 scripts/
   boot-test.sh    boots the kernel and fails if the banner never appears

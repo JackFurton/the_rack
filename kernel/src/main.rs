@@ -6,8 +6,10 @@
 #![no_main]
 
 pub mod exceptions;
+pub mod gic;
 pub mod semihosting;
 pub mod sync;
+pub mod timer;
 pub mod uart;
 
 use core::arch::{asm, global_asm};
@@ -45,9 +47,27 @@ pub extern "C" fn kernel_main() -> ! {
     exceptions::self_test();
     sync::self_test();
 
+    // Interrupt controller first: unmasking IRQs in PSTATE achieves nothing
+    // until something is willing to forward one.
+    gic::init();
+    println!();
+    println!("gic: {} interrupt lines", gic::num_interrupts());
+
+    timer::init();
+    println!(
+        "timer: {} Hz counter, tick every {} ms",
+        timer::frequency(),
+        1000 / timer::TICK_HZ
+    );
+
     println!();
     println!("tier 0 complete. we are alive on bare metal.");
     println!("tier 1: exception vectors online.");
+
+    // Everything is armed. From here the machine runs on its own.
+    sync::enable_interrupts();
+    println!("tier 1: heartbeat started, interrupts live.");
+    println!();
 
     halt()
 }
