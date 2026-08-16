@@ -43,13 +43,29 @@ if [ ! -f "$KERNEL" ]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 LOG="$WORK/serial.log"
 STATUS_FILE="$WORK/qemu.status"
+PID_FILE="$WORK/qemu.pid"
 
-# Wrapping QEMU in a subshell that records its exit code is the reliable way to
-# tell "still running" from "exited on its own"; kill -0 cannot, because an
-# unreaped child still answers.
+# Kill QEMU on every exit path, including a failed assertion, a set -e abort,
+# or Ctrl-C. A guest that is never told to stop runs forever: it gets
+# reparented to launchd and sits there burning a core, and nothing later in
+# this script will ever find it again.
+cleanup() {
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    fi
+    rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# QEMU runs inside a subshell so its exit code can be recorded, which is how we
+# tell "still running" from "exited on its own". kill -0 cannot tell us that,
+# because an unreaped child still answers it.
+#
+# The subshell writes QEMU's own PID to a file rather than letting the caller
+# assume $! is QEMU. It is not: $! here is the subshell, and killing the
+# subshell leaves the guest running.
 (
     qemu-system-aarch64 \
         -machine virt \
@@ -58,8 +74,13 @@ STATUS_FILE="$WORK/qemu.status"
         -display none \
         -serial "file:$LOG" \
         -semihosting-config enable=on,target=native \
-        -kernel "$KERNEL" 2>"$WORK/qemu.stderr"
-    echo $? >"$STATUS_FILE"
+        -kernel "$KERNEL" 2>"$WORK/qemu.stderr" &
+    qemu_pid=$!
+    echo "$qemu_pid" >"$PID_FILE"
+
+    qemu_status=0
+    wait "$qemu_pid" || qemu_status=$?
+    echo "$qemu_status" >"$STATUS_FILE"
 ) &
 RUNNER_PID=$!
 
@@ -94,9 +115,16 @@ if [ -f "$STATUS_FILE" ]; then
     qemu_status="$(cat "$STATUS_FILE")"
 else
     qemu_status="running"
-    kill "$RUNNER_PID" 2>/dev/null || true
+    # Kill the guest, not the subshell wrapping it. Killing the subshell
+    # orphans QEMU instead of stopping it.
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
 fi
 wait "$RUNNER_PID" 2>/dev/null || true
+
+# Nothing should be left behind by the time the report prints.
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "boot-test: warning, QEMU $(cat "$PID_FILE") is still alive" >&2
+fi
 
 echo "--- serial console ---"
 cat "$LOG" 2>/dev/null || true

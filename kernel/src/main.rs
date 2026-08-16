@@ -61,11 +61,20 @@ fn current_el() -> u64 {
     (el >> 2) & 0b11
 }
 
-/// Park the core forever. Cheaper than a spin: `wfe` stops the core until
-/// something wakes it, and nothing will.
+/// Park the core forever.
+///
+/// `wfi`, not `wfe`. The two look interchangeable and are not. `wfe` sleeps
+/// only until the event register is set, and both real cores and QEMU's TCG
+/// treat it as close to a no-op when nothing is going to signal an event, so a
+/// `wfe` loop spins at full tilt. Under QEMU that is a host core pinned at
+/// 100% by a kernel that is doing nothing at all.
+///
+/// `wfi` genuinely stops the core until an interrupt arrives, and QEMU halts
+/// the vCPU thread for it. It is also the right primitive for the eventual
+/// idle task, so the scheduler in tier 2 wants this shape anyway.
 pub fn halt() -> ! {
     loop {
-        unsafe { asm!("wfe", options(nomem, nostack)) };
+        unsafe { asm!("wfi", options(nomem, nostack)) };
     }
 }
 
