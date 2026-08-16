@@ -35,6 +35,8 @@ trap self test: executing brk #0x42
   comment: 0x42
 -----------------
 trap self test: resumed, registers intact
+lock self test: unlocked=false locked=true nested=true released=false
+lock self test: passed, guarded counter reached 1
 
 tier 0 complete. we are alive on bare metal.
 tier 1: exception vectors online.
@@ -102,6 +104,16 @@ trapped and belongs to userspace.
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
 
+**Why the console lock is not a spinlock.** Rust's atomics compile to
+`LDXR`/`STXR`, which depend on the exclusive monitor, and the architecture only
+guarantees that works for Normal cacheable memory. With the MMU off every
+access is Device memory, where `STXR` is permitted to fail forever. QEMU's TCG
+emulates exclusives faithfully anyway, so an `AtomicBool` spinlock passes every
+test we can run today and then hangs on real silicon. On one core with no
+preemption, masking interrupts is not an approximation of mutual exclusion, it
+is exactly mutual exclusion, and it works with the MMU off. This grows a real
+spinlock underneath the same API when tier 6 boots a second core.
+
 ## Layout
 
 ```
@@ -114,6 +126,7 @@ kernel/
     main.rs       kernel_main, panic handler
     uart.rs       PL011 driver and the print!/println! macros
     exceptions.rs trap frame layout, ESR decoding, handler policy
+    sync.rs       interrupt masking and the console lock
     semihosting.rs asking QEMU to shut the machine down
 scripts/
   boot-test.sh    boots the kernel and fails if the banner never appears

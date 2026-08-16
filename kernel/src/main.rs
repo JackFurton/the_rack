@@ -7,6 +7,7 @@
 
 pub mod exceptions;
 pub mod semihosting;
+pub mod sync;
 pub mod uart;
 
 use core::arch::{asm, global_asm};
@@ -42,6 +43,7 @@ pub extern "C" fn kernel_main() -> ! {
     println!();
 
     exceptions::self_test();
+    sync::self_test();
 
     println!();
     println!("tier 0 complete. we are alive on bare metal.");
