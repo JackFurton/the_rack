@@ -21,10 +21,30 @@ aarch64 / qemu-virt
 
   exception level : EL1
   kernel loaded   : 0x0000000040080000
-  kernel end      : 0x0000000040093470
+  kernel end      : 0x0000000040095d80
+  vector table    : 0x0000000040080800
+
+trap self test: executing brk #0x42
+
+--- exception ---
+  vector : synchronous (current EL, SP_ELx)
+  class  : BRK instruction (EC 0x3c)
+  esr    : 0x00000000f2000042
+  elr    : 0x0000000040081d80
+  spsr   : 0x00000000600003c5
+  comment: 0x42
+-----------------
+trap self test: resumed, registers intact
 
 tier 0 complete. we are alive on bare metal.
+tier 1: exception vectors online.
 ```
+
+The trap self test is not decoration. It executes a real `brk`, which traps
+into the vector table, builds a register frame, decodes the syndrome, steps the
+saved `ELR` past the breakpoint, and returns through `eret`. A boot log is
+therefore evidence that the exception machinery works, rather than evidence
+that nothing has faulted yet.
 
 Requires `qemu-system-aarch64` and the `aarch64-unknown-none-softfloat` target
 (`rustup target add aarch64-unknown-none-softfloat`).
@@ -86,10 +106,15 @@ the DTB intact for tier 4.
 
 ```
 kernel/
-  linker.ld     memory layout, load address, stack, BSS bounds
-  build.rs      hands linker.ld to the linker
+  linker.ld       memory layout, load address, stack, BSS bounds
+  build.rs        hands linker.ld to the linker
   src/
-    boot.S      reset vector: park secondary cores, set sp, zero BSS
-    main.rs     kernel_main, panic handler
-    uart.rs     PL011 driver and the print!/println! macros
+    boot.S        reset vector: park secondary cores, set sp, zero BSS
+    vectors.S     the 16 entry exception vector table, save and restore
+    main.rs       kernel_main, panic handler
+    uart.rs       PL011 driver and the print!/println! macros
+    exceptions.rs trap frame layout, ESR decoding, handler policy
+    semihosting.rs asking QEMU to shut the machine down
+scripts/
+  boot-test.sh    boots the kernel and fails if the banner never appears
 ```

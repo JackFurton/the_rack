@@ -23,6 +23,11 @@ EXPECTED=(
     "the_rack"
     "aarch64 / qemu-virt"
     "exception level : EL1"
+    # The trap self test only prints this after taking a real BRK exception,
+    # building a frame, decoding it, and returning through eret. If the save or
+    # restore paths are broken it hangs or faults instead of reaching here.
+    "class  : BRK instruction"
+    "trap self test: resumed"
     "tier 0 complete"
 )
 
