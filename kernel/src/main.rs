@@ -5,6 +5,7 @@
 #![no_std]
 #![no_main]
 
+pub mod semihosting;
 pub mod uart;
 
 use core::arch::{asm, global_asm};
@@ -48,7 +49,9 @@ fn current_el() -> u64 {
     (el >> 2) & 0b11
 }
 
-fn halt() -> ! {
+/// Park the core forever. Cheaper than a spin: `wfe` stops the core until
+/// something wakes it, and nothing will.
+pub fn halt() -> ! {
     loop {
         unsafe { asm!("wfe", options(nomem, nostack)) };
     }
@@ -63,5 +66,8 @@ fn panic(info: &PanicInfo) -> ! {
     }
     println!("  {}", info.message());
 
-    halt()
+    // Bring the machine down rather than hang. Under QEMU this exits with a
+    // failure status, so the boot test reports a panic straight away instead
+    // of waiting out its timeout wondering why the banner never arrived.
+    semihosting::exit(semihosting::EXIT_FAILURE)
 }
