@@ -770,3 +770,51 @@ pub fn user_readable(root: Frame, va: u64, len: u64) -> bool {
 
     true
 }
+
+/// Entries in a translation table at any level.
+const ENTRIES: usize = 512;
+
+impl AddressSpace {
+    /// Free every frame this address space owns: the tables themselves and the
+    /// memory they map.
+    ///
+    /// Takes `self` by value because an address space cannot be used again
+    /// afterwards, and the type system may as well say so.
+    ///
+    /// Assumes this space owns everything mapped in it. That holds while each
+    /// task's memory is private; the moment anything is shared between address
+    /// spaces this needs reference counting instead, and freeing a shared
+    /// frame here would hand a live page back to the allocator.
+    pub fn destroy(self) {
+        free_table(self.root, 0);
+    }
+}
+
+fn free_table(table: Frame, level: usize) {
+    for index in 0..ENTRIES {
+        let entry = read_entry(table, index);
+        if entry & VALID == 0 {
+            continue;
+        }
+
+        let target = Frame::from_addr(entry & ADDR_MASK);
+
+        if level < 3 && entry & TABLE_OR_PAGE != 0 {
+            free_table(target, level + 1);
+            continue;
+        }
+
+        // A leaf. At level 3 that is one frame; at levels 1 and 2 it is a
+        // block covering many, and freeing only its first frame would leak the
+        // rest while leaving the allocator convinced they were still in use.
+        let frames_covered = match level {
+            1 => ENTRIES * ENTRIES,
+            2 => ENTRIES,
+            3 => 1,
+            _ => panic!("a level {level} descriptor cannot be a leaf"),
+        };
+        frames::free_contiguous(target, frames_covered);
+    }
+
+    frames::free(table);
+}

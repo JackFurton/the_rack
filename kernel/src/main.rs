@@ -130,6 +130,7 @@ extern "C" fn kernel_main_high() -> ! {
     tasks::preemption_self_test();
     tasks::isolation_self_test();
     tasks::user_self_test();
+    tasks::lifecycle_self_test();
     println!("tier 2: preemptive scheduling online.");
     println!("tier 2: EL0 and syscalls online.");
     println!();

@@ -47,11 +47,10 @@ const STACK_CANARY: u64 = 0x5441_434b_5f43_414e; // "TACK_CAN"
 
 /// Task table size.
 ///
-/// Sized for the self tests rather than for anything real, because a finished
-/// task holds its slot forever right now. Reclaiming slots is #20; until then
-/// this number has to cover every task the kernel has ever created, not every
-/// task alive at once.
-const MAX_TASKS: usize = 16;
+/// This is a limit on tasks alive at once, not on tasks ever created. The self
+/// tests run eleven tasks through these eight slots, which is itself a check
+/// that slots really do come back.
+const MAX_TASKS: usize = 8;
 
 /// Offsets within the 96 byte frame `switch.S` pushes, in u64 units.
 ///
@@ -66,7 +65,16 @@ const SWITCH_FRAME_WORDS: usize = 12;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Runnable,
-    Finished,
+    /// Finished, but still holding its kernel stack and address space.
+    ///
+    /// A task cannot free its own kernel stack: it is standing on it. So
+    /// exiting is two steps, and this is the gap between them. Nothing will
+    /// ever schedule a task in this state, which is what makes its stack safe
+    /// for somebody else to release.
+    Zombie,
+    /// Resources returned to the allocator. Only the table slot and the exit
+    /// code remain, so the exit code can still be collected.
+    Dead,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +93,12 @@ struct Task {
     sp: u64,
     /// Base of the kernel stack, kept so it can be handed back later.
     stack: Frame,
+    /// Whether `stack` came from the frame allocator and must go back to it.
+    ///
+    /// Task 0's stack came from the linker. Handing that to the allocator
+    /// would mark memory free that the kernel is still using, and the
+    /// allocator would believe it.
+    owns_stack: bool,
     state: State,
     exit_code: Option<u64>,
 }
@@ -196,6 +210,7 @@ pub fn init() {
         // Task 0's stack came from the linker, not the allocator. Recorded so
         // the field is not a lie, and never freed.
         stack: Frame::from_addr(0x4000_0000),
+        owns_stack: false,
         state: State::Runnable,
         exit_code: None,
     });
@@ -246,6 +261,7 @@ pub fn spawn_in(
         space,
         sp,
         stack,
+        owns_stack: true,
         state: State::Runnable,
         exit_code: None,
     });
@@ -277,6 +293,11 @@ pub fn yield_now() {
 /// Must be called with interrupts already masked. Shared by the voluntary and
 /// the preemptive paths, which differ only in how they got here.
 fn switch_to_next(reason: Reason) {
+    // Before choosing, hand back anything the dead are still holding. This is
+    // the natural place: we are running on some other task's stack, so every
+    // zombie's stack is memory nobody is standing on.
+    reap_zombies();
+
     let (save_to, resume, root) = {
         let mut scheduler = SCHEDULER.lock();
 
@@ -382,7 +403,7 @@ pub extern "C" fn task_finished() -> ! {
         let mut scheduler = SCHEDULER.lock();
         let current = scheduler.current;
         if let Some(task) = scheduler.tasks[current].as_mut() {
-            task.state = State::Finished;
+            task.state = State::Zombie;
         }
     }
 
@@ -414,9 +435,12 @@ pub fn canaries_intact() -> bool {
     scheduler
         .tasks
         .iter()
-        .enumerate()
-        .filter(|(slot, _)| *slot != 0) // task 0's stack is the linker's
-        .filter_map(|(_, task)| task.as_ref())
+        .filter_map(Option::as_ref)
+        // Only stacks this task still owns. Task 0's came from the linker and
+        // never had a canary, and a reaped task's stack has been handed back
+        // to the allocator, so whatever is at its base now belongs to whoever
+        // got it next.
+        .filter(|task| task.owns_stack && task.state != State::Dead)
         .all(|task| {
             let base = paging::phys_to_virt(task.stack.addr());
             unsafe { core::ptr::read_volatile(base as *const u64) == STACK_CANARY }
@@ -514,6 +538,7 @@ pub fn self_test() {
     drop(trace);
 
     assert!(canaries_intact(), "a kernel stack overflowed");
+    release_dead();
 
     print!("task self test: passed, ");
     println!("2 tasks alternated 3 turns each, locals intact, canaries intact");
@@ -589,6 +614,7 @@ pub fn preemption_self_test() {
         "not every spinner got scheduled"
     );
     assert!(canaries_intact(), "a kernel stack overflowed");
+    release_dead();
 
     print!("preemption self test: passed, ");
     println!("{total} switches, {preemptions} of them preemptive, {distinct} tasks scheduled");
@@ -654,6 +680,7 @@ pub fn isolation_self_test() {
     drop(seen);
 
     assert!(canaries_intact(), "a kernel stack overflowed");
+    release_dead();
 
     print!("isolation self test: passed, ");
     println!("{ISOLATION_WORKERS} tasks each read their own value back from {ISOLATION_VA:#x}");
@@ -764,7 +791,7 @@ pub fn exit_current(code: u64) -> ! {
         let mut scheduler = SCHEDULER.lock();
         let current = scheduler.current;
         if let Some(task) = scheduler.tasks[current].as_mut() {
-            task.state = State::Finished;
+            task.state = State::Zombie;
             task.exit_code = Some(code);
         }
     }
@@ -779,10 +806,11 @@ pub fn exit_code(id: TaskId) -> Option<u64> {
     SCHEDULER.lock().tasks[id.0].as_ref()?.exit_code
 }
 
+/// Has this task stopped running, whether or not it has been cleaned up yet?
 fn finished(id: TaskId) -> bool {
     matches!(
         SCHEDULER.lock().tasks[id.0].as_ref(),
-        Some(task) if task.state == State::Finished
+        Some(task) if task.state != State::Runnable
     )
 }
 
@@ -812,6 +840,154 @@ pub fn user_self_test() {
         "expected exactly one privileged instruction to be refused, saw {traps}"
     );
 
+    // Exit code collected, so the slot can go.
+    release_dead();
+
     print!("user self test: passed, ");
     println!("EL0 ran, {traps} privileged instruction refused, kernel pointer rejected");
+}
+
+/// Return the resources of every finished task except the running one.
+///
+/// The exclusion is not a detail. A task that has exited is still executing on
+/// its kernel stack until it switches away, and freeing that stack out from
+/// under it hands live memory to the allocator, which will cheerfully give it
+/// to somebody else.
+///
+/// The table slot and the exit code stay behind, so a task that exited can
+/// still be asked what it exited with.
+pub fn reap_zombies() {
+    loop {
+        // Take one victim's resources out under the lock, then release the
+        // lock before touching the allocator. One at a time keeps the borrow
+        // simple and the lock held briefly.
+        let salvage = {
+            let mut scheduler = SCHEDULER.lock();
+            let current = scheduler.current;
+
+            let victim = scheduler
+                .tasks
+                .iter()
+                .position(|task| matches!(task, Some(task) if task.state == State::Zombie));
+
+            match victim {
+                Some(slot) if slot != current => {
+                    let task = scheduler.tasks[slot].as_mut().unwrap();
+                    task.state = State::Dead;
+                    let stack = task.owns_stack.then_some(task.stack);
+                    let space = task.space.take();
+                    Some((stack, space))
+                }
+                _ => None,
+            }
+        };
+
+        let Some((stack, space)) = salvage else {
+            return;
+        };
+
+        if let Some(stack) = stack {
+            frames::free_contiguous(stack, STACK_FRAMES);
+        }
+        if let Some(space) = space {
+            space.destroy();
+        }
+    }
+}
+
+/// Free the table slots of tasks that have been reaped.
+///
+/// Separate from reaping because the exit code lives in the slot. Collecting
+/// it is the caller's business, and doing this automatically would mean a task
+/// could exit and vanish before anybody asked how it went.
+pub fn release_dead() -> usize {
+    let mut scheduler = SCHEDULER.lock();
+    let current = scheduler.current;
+    let mut released = 0;
+
+    for slot in 0..MAX_TASKS {
+        if slot == current {
+            continue;
+        }
+        if matches!(&scheduler.tasks[slot], Some(task) if task.state == State::Dead) {
+            scheduler.tasks[slot] = None;
+            released += 1;
+        }
+    }
+
+    released
+}
+
+/// Run a task through its whole life and check the machine is the same size
+/// afterwards.
+///
+/// The frame count is the entire point. It turns a leak from something noticed
+/// months later into something a boot fails on.
+pub fn lifecycle_self_test() {
+    // Settle first. Earlier tests leave finished tasks behind, and reaping
+    // those part way through would make the machine *gain* free frames
+    // relative to the baseline, which reads as a negative leak and is just as
+    // wrong as a positive one.
+    reap_zombies();
+    release_dead();
+
+    let before_frames = frames::free_frames();
+    let before_slots = free_slots();
+
+    let id = spawn_user("shortlived");
+
+    let during = frames::free_frames();
+    assert!(
+        during < before_frames,
+        "spawning a user task consumed no frames, so this test proves nothing"
+    );
+    let consumed = before_frames - during;
+
+    while !is_dead(id) {
+        yield_now();
+    }
+
+    // Collectable after reaping, which is the whole reason reaping and
+    // releasing are separate steps.
+    let code = exit_code(id).expect("reaped task lost its exit code");
+    const EFAULT: u64 = -2i64 as u64;
+    assert_eq!(
+        code, EFAULT,
+        "unexpected exit code {code} from the user task"
+    );
+
+    let released = release_dead();
+    assert!(released > 0, "no slot was released");
+
+    let after_frames = frames::free_frames();
+    let after_slots = free_slots();
+
+    // Both directions are wrong. Ending with fewer free frames is a leak;
+    // ending with more means something freed memory it did not own, which is
+    // the more dangerous of the two and would read as "leaked 0" under a
+    // saturating subtraction.
+    assert_eq!(
+        after_frames, before_frames,
+        "task took {consumed} frames; free count went {before_frames} -> {after_frames}"
+    );
+    assert_eq!(after_slots, before_slots, "task leaked a table slot");
+
+    print!("lifecycle self test: passed, ");
+    println!("task took {consumed} frames and gave back all {consumed}");
+}
+
+fn is_dead(id: TaskId) -> bool {
+    matches!(
+        SCHEDULER.lock().tasks[id.0].as_ref(),
+        Some(task) if task.state == State::Dead
+    )
+}
+
+fn free_slots() -> usize {
+    SCHEDULER
+        .lock()
+        .tasks
+        .iter()
+        .filter(|t| t.is_none())
+        .count()
 }
