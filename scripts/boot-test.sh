@@ -30,6 +30,12 @@ EXPECTED=(
     "trap self test: resumed"
     "lock self test: passed"
     "frame self test: passed"
+    # Proves the MMU is not merely on but actually restricting things: each of
+    # these is an access that was refused and recovered from.
+    "paging self test: passed"
+    "write to .text   : permission fault"
+    "write to .rodata : permission fault"
+    "read low half    : translation fault"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

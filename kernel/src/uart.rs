@@ -45,12 +45,21 @@ impl Uart {
         Self { base }
     }
 
+    /// Address of a register, through whichever alias currently works.
+    ///
+    /// `base` is physical. Once the kernel moves to the high half the physical
+    /// address stops being mapped, so this has to be translated on every
+    /// access rather than resolved once at construction.
+    fn reg(&self, offset: usize) -> usize {
+        crate::paging::phys_to_virt((self.base + offset) as u64) as usize
+    }
+
     unsafe fn read(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.base + offset) as *const u32) }
+        unsafe { read_volatile(self.reg(offset) as *const u32) }
     }
 
     unsafe fn write(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
+        unsafe { write_volatile(self.reg(offset) as *mut u32, value) }
     }
 
     /// Configure for 115200 baud, 8N1, FIFOs on.
@@ -118,6 +127,41 @@ static CONSOLE: Lock<Uart> = Lock::new(unsafe { Uart::new(PL011_BASE) });
 
 pub fn init() {
     CONSOLE.lock().init();
+}
+
+/// Write a string straight to the physical UART, with no lock, no formatting,
+/// and no address translation.
+///
+/// This exists for the window between reset and the MMU coming on, where
+/// `println!` cannot be used at all. `format_args!` builds a table of function
+/// pointers in `.rodata`, and those are absolute addresses linked at the
+/// kernel's high half virtual address, which does not translate to anything
+/// until paging is up. Calling `println!` there branches into nowhere.
+///
+/// A string literal is fine, because the compiler materialises its address
+/// with PC relative `adrp`, which resolves correctly whether we are running
+/// physically or virtually.
+///
+/// Without this the early boot path is exactly as blind as tier 0 was before
+/// the exception vectors existed.
+pub fn emergency_print(message: &str) {
+    for byte in message.bytes() {
+        unsafe {
+            if byte == b'\n' {
+                raw_put(PL011_BASE, b'\r');
+            }
+            raw_put(PL011_BASE, byte);
+        }
+    }
+}
+
+unsafe fn raw_put(base: usize, byte: u8) {
+    unsafe {
+        while read_volatile((base + FR) as *const u32) & FR_TXFF != 0 {
+            core::hint::spin_loop();
+        }
+        write_volatile((base + DR) as *mut u32, byte as u32);
+    }
 }
 
 #[doc(hidden)]

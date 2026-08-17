@@ -81,12 +81,20 @@ impl Frame {
         Frame(RAM_BASE + index as u64 * FRAME_SIZE)
     }
 
-    /// Pointer to the frame's contents.
+    /// Wrap a physical address that is already known to name a frame.
+    pub fn from_addr(addr: u64) -> Self {
+        debug_assert!(addr.is_multiple_of(FRAME_SIZE));
+        Frame(addr)
+    }
+
+    /// Pointer to the frame's contents, through whichever alias currently
+    /// works.
     ///
-    /// Only sound while the MMU is off and physical addresses are directly
-    /// reachable. #5 will need to map this somewhere first.
+    /// Goes through `phys_to_virt` rather than casting the physical address
+    /// directly, because once the kernel is running in the high half the
+    /// physical address is no longer mapped at all.
     fn as_mut_ptr(&self) -> *mut u8 {
-        self.0 as *mut u8
+        crate::paging::phys_to_virt(self.0) as *mut u8
     }
 }
 
