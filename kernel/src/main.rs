@@ -8,6 +8,7 @@
 pub mod exceptions;
 pub mod frames;
 pub mod gic;
+pub mod paging;
 pub mod semihosting;
 pub mod sync;
 pub mod timer;
@@ -24,12 +25,50 @@ unsafe extern "C" {
 }
 
 /// Called by `boot.S` once core 0 has a stack and a zeroed BSS.
+///
+/// Runs at physical addresses with the MMU off, and is deliberately tiny.
+///
+/// Nothing here may use `println!`. The kernel is linked at its high half
+/// address, so the function pointers `format_args!` places in `.rodata` are
+/// high addresses, and nothing translates yet. Only `uart::emergency_print`
+/// works, and only with string literals.
+///
+/// The job is to get the MMU on and get out.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
+    uart::emergency_print("\nthe_rack: booting, mmu off\n");
+
+    // PC relative addressing means the linker symbols this reads resolve to
+    // physical addresses right now, and to high ones after the jump, with no
+    // relocation and no special casing.
+    frames::init();
+    uart::emergency_print("the_rack: frame allocator up, building page tables\n");
+
+    // Build both roots while the MMU is off, enable with the identity map
+    // holding the program counter steady, then leave the low half behind.
+    let (ttbr0, ttbr1) = paging::build_tables();
+    uart::emergency_print("the_rack: tables built, enabling mmu\n");
+
+    unsafe { paging::enable(ttbr0, ttbr1) };
+    uart::emergency_print("the_rack: mmu on, jumping to the high half\n");
+
+    unsafe { paging::jump_to_high_half(kernel_main_high) }
+}
+
+/// Everything from here runs at a high half virtual address.
+///
+/// Separate function because the jump is a branch to a computed address, not a
+/// call: there is no return path to the low half, and the low half is about to
+/// stop existing.
+extern "C" fn kernel_main_high() -> ! {
+    // Nothing may touch a device register or a frame before this: the physical
+    // addresses they hold are no longer the addresses that work.
+    unsafe { paging::finish_high_half() };
+
     uart::init();
 
-    // Before anything else that could fault. Until VBAR_EL1 is set, a fault
-    // produces silence rather than a report.
+    // The vector table's address is only meaningful now. Everything before
+    // this point faults silently, which is the price of linking high.
     exceptions::init();
 
     println!();
@@ -37,15 +76,15 @@ pub extern "C" fn kernel_main() -> ! {
     println!("aarch64 / qemu-virt");
     println!();
     println!("  exception level : EL{}", current_el());
-    println!("  kernel loaded   : {:#018x}", 0x4008_0000usize);
+    println!("  kernel loaded   : {:#018x} physical", 0x4008_0000usize);
     println!(
-        "  kernel end      : {:#018x}",
+        "  kernel end      : {:#018x} virtual",
         &raw const __kernel_end as usize
     );
     println!("  vector table    : {:#018x}", exceptions::vector_base());
     println!();
 
-    frames::init();
+    paging::print_config();
     println!();
     frames::print_map();
     println!();
@@ -53,6 +92,7 @@ pub extern "C" fn kernel_main() -> ! {
     exceptions::self_test();
     sync::self_test();
     frames::self_test();
+    paging::self_test();
 
     // Interrupt controller first: unmasking IRQs in PSTATE achieves nothing
     // until something is willing to forward one.
@@ -70,6 +110,7 @@ pub extern "C" fn kernel_main() -> ! {
     println!();
     println!("tier 0 complete. we are alive on bare metal.");
     println!("tier 1: exception vectors online.");
+    println!("tier 1: paging online, kernel in the high half.");
 
     // Everything is armed. From here the machine runs on its own.
     sync::enable_interrupts();

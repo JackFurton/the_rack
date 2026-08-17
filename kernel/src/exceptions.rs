@@ -12,6 +12,7 @@
 
 use core::arch::asm;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{print, println};
 
@@ -207,6 +208,55 @@ pub fn vector_base() -> u64 {
     base
 }
 
+/// Set while a probe is deliberately touching memory it may not be allowed to.
+static EXPECTING_FAULT: AtomicBool = AtomicBool::new(false);
+/// `ESR_EL1` from the probe's fault, or 0 if it did not fault.
+static PROBE_ESR: AtomicU64 = AtomicU64::new(0);
+
+/// Result of deliberately touching memory that may be protected.
+pub struct Probe {
+    esr: u64,
+}
+
+impl Probe {
+    /// Did the access fault?
+    pub fn faulted(&self) -> bool {
+        self.esr != 0
+    }
+
+    /// What the fault was, for reporting.
+    pub fn describe(&self) -> &'static str {
+        if self.esr == 0 {
+            return "no fault";
+        }
+        Syndrome(self.esr).fault_status()
+    }
+}
+
+/// Run `probe`, catching a memory fault instead of panicking on it.
+///
+/// This is how the paging self test can assert that writing to `.text` is
+/// refused: without it, proving the permission works would mean crashing the
+/// kernel to demonstrate it.
+///
+/// The recovery is to skip the faulting instruction, which is sound for a
+/// single volatile load or store and nothing more. `probe` should contain one
+/// access and no state that a half-executed sequence would corrupt.
+///
+/// Not reentrant, and not safe once more than one thing can run at a time.
+/// Both are fine for a boot-time self test on one core.
+pub fn probe(probe: impl FnOnce()) -> Probe {
+    PROBE_ESR.store(0, Ordering::Relaxed);
+    EXPECTING_FAULT.store(true, Ordering::Relaxed);
+
+    probe();
+
+    EXPECTING_FAULT.store(false, Ordering::Relaxed);
+    Probe {
+        esr: PROBE_ESR.load(Ordering::Relaxed),
+    }
+}
+
 /// Every exception in the system arrives here, called from `.Lcommon_trap`.
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
@@ -221,6 +271,16 @@ pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     }
 
     let syndrome = Syndrome(frame.esr);
+
+    // A probe deliberately touched something it was not allowed to. Record it,
+    // step over the offending instruction, and carry on. This is how the
+    // permission checks in the paging self test are able to pass rather than
+    // panic.
+    if syndrome.is_abort() && EXPECTING_FAULT.load(Ordering::Relaxed) {
+        PROBE_ESR.store(frame.esr, Ordering::Relaxed);
+        frame.elr += 4;
+        return;
+    }
 
     report(frame, index, syndrome);
 

@@ -16,38 +16,44 @@ Boots the kernel on the QEMU `virt` machine with its UART on your terminal.
 `Ctrl-A` then `X` quits.
 
 ```
+the_rack: booting, mmu off
+the_rack: frame allocator up, building page tables
+the_rack: tables built, enabling mmu
+the_rack: mmu on, jumping to the high half
+
 the_rack 0.1.0
 aarch64 / qemu-virt
 
   exception level : EL1
-  kernel loaded   : 0x0000000040080000
-  kernel end      : 0x0000000040095d80
-  vector table    : 0x0000000040080800
+  kernel loaded   : 0x0000000040080000 physical
+  kernel end      : 0xffff0000400a3000 virtual
+  vector table    : 0xffff000040080800
+
+mmu: enabled, 4 KiB granule, 48 bit addresses
+  sctlr  : 0x0000000000c5183d  mmu=1 dcache=1 icache=1
+  tcr    : 0x00000004b5103590  ttbr0 walks disabled
+  ttbr0  : 0x0000000000000000
+  ttbr1  : 0x00000000400a4000
+  kernel : 0xffff000000000000 + physical
 
 memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
-  reserved : 0x0040000000..0x004009e000   632 KiB  kernel image and DTB
-  free     : 0x004009e000..0x0050000000   255 MiB  65378 frames
+  reserved : 0x0040000000..0x00400a3000   652 KiB  kernel image and DTB
+  free     : 0x00400a3000..0x0050000000   255 MiB  65363 frames
 
-trap self test: executing brk #0x42
-
---- exception ---
-  vector : synchronous (current EL, SP_ELx)
-  class  : BRK instruction (EC 0x3c)
-  esr    : 0x00000000f2000042
-  elr    : 0x0000000040081d80
-  spsr   : 0x00000000600003c5
-  comment: 0x42
------------------
 trap self test: resumed, registers intact
-lock self test: unlocked=false locked=true nested=true released=false
 lock self test: passed, guarded counter reached 1
-frame self test: passed, reuse of 0x4009e000 came back clean, 65378 frames free
+frame self test: passed, reuse of 0x400ad000 came back clean, 65363 frames free
+paging self test: passed, running at 0xffff000040084a94
+  write to .text   : permission fault
+  write to .rodata : permission fault
+  read low half    : translation fault, nothing mapped
 
 gic: 288 interrupt lines
 timer: 62500000 Hz counter, tick every 10 ms
 
 tier 0 complete. we are alive on bare metal.
 tier 1: exception vectors online.
+tier 1: paging online, kernel in the high half.
 tier 1: heartbeat started, interrupts live.
 
 uptime 1s (100 ticks)
@@ -120,6 +126,18 @@ trapped and belongs to userspace.
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
 
+**Why the kernel is linked high but loaded low.** PC relative references
+(`adrp`) fix themselves up for free: they encode a link-time *difference*, so
+they resolve to physical addresses with the MMU off and to high ones afterwards
+with no relocation step. Absolute pointers stored in static data do not. The
+function pointers `format_args!` builds into `.rodata` hold whatever address
+the linker chose. Linking low and jumping to the high half therefore works
+right up until the first `println!`, which branches into an address that no
+longer translates. Linking at the high address and loading at the physical one
+makes those pointers correct from the start. The price is that nothing before
+the MMU comes on may use formatting at all, which is what `emergency_print`
+is for.
+
 **Why the frame allocator is a bitmap.** The compact alternative threads a
 free list through the free frames themselves and costs no separate storage. It
 also puts the allocator's metadata inside memory it has given away the rights
@@ -164,6 +182,7 @@ kernel/
     sync.rs       interrupt masking and the console lock
     frames.rs     physical frame allocator
     gic.rs        GICv2 distributor and CPU interface
+    paging.rs     page tables, permissions, the move to the high half
     timer.rs      generic timer, the 100 Hz heartbeat
     semihosting.rs asking QEMU to shut the machine down
 scripts/

@@ -58,24 +58,31 @@ pub const SPURIOUS_INTID: u32 = 1023;
 /// from intuition and a reliable source of confusion.
 const DEFAULT_PRIORITY: u8 = 0xa0;
 
+/// Register address, through whichever alias currently works. The bases above
+/// are physical, and the physical address stops being mapped once the kernel
+/// moves to the high half.
+fn reg(base: usize, offset: usize) -> usize {
+    crate::paging::phys_to_virt((base + offset) as u64) as usize
+}
+
 unsafe fn gicd_read(offset: usize) -> u32 {
-    unsafe { read_volatile((GICD_BASE + offset) as *const u32) }
+    unsafe { read_volatile(reg(GICD_BASE, offset) as *const u32) }
 }
 
 unsafe fn gicd_write(offset: usize, value: u32) {
-    unsafe { write_volatile((GICD_BASE + offset) as *mut u32, value) }
+    unsafe { write_volatile(reg(GICD_BASE, offset) as *mut u32, value) }
 }
 
 unsafe fn gicd_write_byte(offset: usize, value: u8) {
-    unsafe { write_volatile((GICD_BASE + offset) as *mut u8, value) }
+    unsafe { write_volatile(reg(GICD_BASE, offset) as *mut u8, value) }
 }
 
 unsafe fn gicc_read(offset: usize) -> u32 {
-    unsafe { read_volatile((GICC_BASE + offset) as *const u32) }
+    unsafe { read_volatile(reg(GICC_BASE, offset) as *const u32) }
 }
 
 unsafe fn gicc_write(offset: usize, value: u32) {
-    unsafe { write_volatile((GICC_BASE + offset) as *mut u32, value) }
+    unsafe { write_volatile(reg(GICC_BASE, offset) as *mut u32, value) }
 }
 
 /// How many interrupt IDs this distributor implements.
