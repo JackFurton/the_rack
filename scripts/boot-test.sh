@@ -29,6 +29,7 @@ EXPECTED=(
     "class  : BRK instruction"
     "trap self test: resumed"
     "lock self test: passed"
+    "frame self test: passed"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
@@ -49,8 +50,19 @@ FORBIDDEN=(
     "kernel panic"
 )
 
+# Build first, rather than testing whatever binary happens to be in target/.
+#
+# Not paranoia. Editing a source file and re-running this script would
+# otherwise silently re-test the previous build, which reads as "my change did
+# nothing" or, worse, "a bug I already fixed is still there". CI happens to
+# build in a separate step so it never hit this; a person iterating locally
+# hits it immediately.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    cargo build --quiet
+fi
+
 if [ ! -f "$KERNEL" ]; then
-    echo "boot-test: $KERNEL not found, run cargo build first" >&2
+    echo "boot-test: $KERNEL not found, and the build did not produce it" >&2
     exit 1
 fi
 

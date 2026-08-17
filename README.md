@@ -24,6 +24,10 @@ aarch64 / qemu-virt
   kernel end      : 0x0000000040095d80
   vector table    : 0x0000000040080800
 
+memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
+  reserved : 0x0040000000..0x004009e000   632 KiB  kernel image and DTB
+  free     : 0x004009e000..0x0050000000   255 MiB  65378 frames
+
 trap self test: executing brk #0x42
 
 --- exception ---
@@ -37,6 +41,7 @@ trap self test: executing brk #0x42
 trap self test: resumed, registers intact
 lock self test: unlocked=false locked=true nested=true released=false
 lock self test: passed, guarded counter reached 1
+frame self test: passed, reuse of 0x4009e000 came back clean, 65378 frames free
 
 gic: 288 interrupt lines
 timer: 62500000 Hz counter, tick every 10 ms
@@ -115,6 +120,15 @@ trapped and belongs to userspace.
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
 
+**Why the frame allocator is a bitmap.** The compact alternative threads a
+free list through the free frames themselves and costs no separate storage. It
+also puts the allocator's metadata inside memory it has given away the rights
+to, so one wild write into a freed frame corrupts the allocator rather than the
+caller. A bitmap costs one bit per frame, 8 KiB of BSS for 256 MiB, and buys
+O(1) queries, a printable memory map, and double-free detection. Allocation is
+always the lowest free frame with no search hint, which makes reuse
+deterministic and therefore testable.
+
 **Why the timer re-arms with CVAL, not TVAL.** `CNTP_TVAL_EL0` is a countdown
 from the moment it is written, so re-arming with it makes every period
 `interval + however long it took to reach the handler`. That latency compounds
@@ -148,6 +162,7 @@ kernel/
     uart.rs       PL011 driver and the print!/println! macros
     exceptions.rs trap frame layout, ESR decoding, handler policy
     sync.rs       interrupt masking and the console lock
+    frames.rs     physical frame allocator
     gic.rs        GICv2 distributor and CPU interface
     timer.rs      generic timer, the 100 Hz heartbeat
     semihosting.rs asking QEMU to shut the machine down
