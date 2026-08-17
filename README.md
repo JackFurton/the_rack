@@ -67,8 +67,19 @@ isolation self test: passed, 3 tasks each read their own value back from 0x10000
 hello from EL0, running unprivileged
 user self test: passed, EL0 ran, 1 privileged instruction refused, kernel pointer rejected
 lifecycle self test: passed, task took 11 frames and gave back all 11
+
+--- task fault ---
+  task   : 1 (faulter)
+  class  : data abort from lower EL
+  fault  : translation fault, nothing mapped at level 2, on a write
+  address: 0x0000000000000000
+  pc     : 0x0000000000400004
+  the kernel is fine. this task is not.
+------------------
+fault self test: passed, task died on translation fault, kernel survived
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
+tier 3: task faults are contained.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -139,6 +150,13 @@ trapped and belongs to userspace.
 **Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
+
+**Why a task fault is judged by exception level, not address.** A fault from
+EL0 is the task's mistake and stops only that task; a fault at EL1 is a kernel
+bug and stays fatal. The tempting shortcut is to look at the faulting address
+and treat low ones as user problems, which is wrong in both directions: the
+kernel faults on user addresses all the time while servicing a syscall, and
+those are kernel bugs.
 
 **Why exiting is two steps.** A task cannot free its own kernel stack: it is
 standing on it. So exiting marks the task a zombie and switches away, and the

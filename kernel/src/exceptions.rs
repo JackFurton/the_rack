@@ -97,6 +97,10 @@ impl fmt::Display for VectorIndex {
 pub struct Syndrome(u64);
 
 impl Syndrome {
+    pub fn from_esr(esr: u64) -> Self {
+        Self(esr)
+    }
+
     pub fn exception_class(&self) -> u64 {
         (self.0 >> 26) & 0x3f
     }
@@ -230,6 +234,23 @@ pub fn privileged_traps() -> u64 {
     PRIVILEGED_TRAPS.load(Ordering::Relaxed)
 }
 
+/// What a task was doing when it died.
+///
+/// Kept against the task rather than printed and discarded, so a supervisor
+/// can ask about it later the same way an exited task keeps its exit code.
+#[derive(Clone, Copy)]
+pub struct Fault {
+    pub esr: u64,
+    pub far: u64,
+    pub elr: u64,
+}
+
+impl Fault {
+    pub fn syndrome(&self) -> Syndrome {
+        Syndrome(self.esr)
+    }
+}
+
 /// Set while a probe is deliberately touching memory it may not be allowed to.
 static EXPECTING_FAULT: AtomicBool = AtomicBool::new(false);
 /// `ESR_EL1` from the probe's fault, or 0 if it did not fault.
@@ -318,6 +339,21 @@ pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
         PRIVILEGED_TRAPS.fetch_add(1, Ordering::Relaxed);
         frame.elr += 4;
         return;
+    }
+
+    // Anything else from a lower exception level is the task's mistake, not
+    // the kernel's. Killing the machine because an unprivileged task
+    // dereferenced null would defeat the point of having privilege levels.
+    //
+    // The test is which exception level it came from, not which address
+    // faulted. The kernel faults on user addresses all the time while
+    // servicing syscalls, and those are kernel bugs.
+    if index.from_lower_el() {
+        crate::tasks::fault_current(Fault {
+            esr: frame.esr,
+            far: frame.far,
+            elr: frame.elr,
+        });
     }
 
     // A probe deliberately touched something it was not allowed to. Record it,
