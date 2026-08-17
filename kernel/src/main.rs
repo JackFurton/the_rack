@@ -11,6 +11,7 @@ pub mod gic;
 pub mod paging;
 pub mod semihosting;
 pub mod sync;
+pub mod tasks;
 pub mod timer;
 pub mod uart;
 
@@ -93,6 +94,9 @@ extern "C" fn kernel_main_high() -> ! {
     sync::self_test();
     frames::self_test();
     paging::self_test();
+    tasks::self_test();
+    println!();
+    tasks::print_table();
 
     // Interrupt controller first: unmasking IRQs in PSTATE achieves nothing
     // until something is willing to forward one.

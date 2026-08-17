@@ -47,6 +47,12 @@ paging self test: passed, running at 0xffff000040084a94
   write to .text   : permission fault
   write to .rodata : permission fault
   read low half    : translation fault, nothing mapped
+task self test: passed, 2 tasks alternated 3 turns each, locals intact, canaries intact
+
+tasks:
+  0* kernel   stack 0xffff000040000000  Runnable
+  1  ping     stack 0xffff0000400b1000  Finished
+  2  pong     stack 0xffff0000400b5000  Finished
 
 gic: 288 interrupt lines
 timer: 62500000 Hz counter, tick every 10 ms
@@ -126,6 +132,15 @@ trapped and belongs to userspace.
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
 
+**Why a cooperative context switch saves so little.** Under AAPCS64 the
+compiler already treats a function call as destroying `x0` through `x18`, so at
+the moment `switch` is called, every value the outgoing task still cares about
+is either in a callee-saved register or already on its stack. Saving twelve
+registers and swapping stack pointers is the whole job. That only holds for a
+*voluntary* switch: preemption from an interrupt gets no such promise, because
+the interrupted code never agreed to a call boundary, which is why the trap
+frame in `vectors.S` saves everything.
+
 **Why the kernel is linked high but loaded low.** PC relative references
 (`adrp`) fix themselves up for free: they encode a link-time *difference*, so
 they resolve to physical addresses with the MMU off and to high ones afterwards
@@ -183,6 +198,8 @@ kernel/
     frames.rs     physical frame allocator
     gic.rs        GICv2 distributor and CPU interface
     paging.rs     page tables, permissions, the move to the high half
+    switch.S      the callee-saved swap that changes which task is running
+    tasks.rs      kernel tasks and cooperative yielding
     timer.rs      generic timer, the 100 Hz heartbeat
     semihosting.rs asking QEMU to shut the machine down
 scripts/

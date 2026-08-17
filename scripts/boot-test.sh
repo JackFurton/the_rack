@@ -36,6 +36,10 @@ EXPECTED=(
     "write to .text   : permission fault"
     "write to .rodata : permission fault"
     "read low half    : translation fault"
+    # Checks the values each task carried across a switch, not just that both
+    # tasks ran. Right order with wrong values means the switch lost state.
+    "task self test: passed"
+    "locals intact"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
