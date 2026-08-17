@@ -62,7 +62,8 @@ tier 1: exception vectors online.
 tier 1: paging online, kernel in the high half.
 tier 1: heartbeat started, interrupts live.
 
-preemption self test: passed, 76 switches, 53 of them preemptive, 4 tasks scheduled
+preemption self test: passed, 82 switches, 58 of them preemptive, 4 tasks scheduled
+isolation self test: passed, 3 tasks each read their own value back from 0x10000000
 tier 2: preemptive scheduling online.
 
 uptime 1s (100 ticks)
@@ -134,6 +135,16 @@ trapped and belongs to userspace.
 **Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
+
+**Why the kernel has no low half of its own.** Task 0 is the kernel, it lives
+entirely above `KERNEL_BASE`, and it runs with an empty `TTBR0`. Tasks without
+an address space get that same empty root rather than inheriting whatever the
+previous task had mapped, which is the difference between "no address space"
+and "somebody else's address space". Switching tasks swaps `TTBR0` and leaves
+`TTBR1` alone, which is the entire reason the kernel was moved high in the
+first place: changing address spaces cannot disturb the kernel's own mappings.
+TLB invalidation is currently `tlbi vmalle1`, which throws away kernel entries
+too. ASIDs are the right answer and are not implemented yet.
 
 **Why a new task must start with interrupts enabled.** `yield_now` always
 switches with interrupts masked, and restores the mask from a local on its own

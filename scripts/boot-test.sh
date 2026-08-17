@@ -44,6 +44,9 @@ EXPECTED=(
     # one is the timer taking the CPU from something not finished with it.
     "preemption self test: passed"
     "tier 2: preemptive scheduling online"
+    # Each task reading back its own value from one shared virtual address is
+    # the property; a single address space cannot produce it.
+    "isolation self test: passed"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

@@ -94,6 +94,9 @@ extern "C" fn kernel_main_high() -> ! {
     sync::self_test();
     frames::self_test();
     paging::self_test();
+
+    // Needed before any task switches, since switching now swaps TTBR0.
+    tasks::init_address_spaces();
     tasks::self_test();
     println!();
     tasks::print_table();
@@ -123,6 +126,7 @@ extern "C" fn kernel_main_high() -> ! {
 
     // Needs live interrupts, so it cannot run with the other self tests.
     tasks::preemption_self_test();
+    tasks::isolation_self_test();
     println!("tier 2: preemptive scheduling online.");
     println!();
 
