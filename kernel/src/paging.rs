@@ -706,3 +706,67 @@ pub unsafe fn enable_user_translation() {
         );
     }
 }
+
+/// Walk `root` for `va` and return the leaf descriptor, if the address maps to
+/// anything at all.
+///
+/// Stops early on a block descriptor, which is a leaf at level 1 or 2 rather
+/// than a pointer to another table.
+pub fn lookup(root: Frame, va: u64) -> Option<u64> {
+    let mut table = root;
+
+    for level in 0..3 {
+        let entry = read_entry(table, table_index(va, level));
+        if entry & VALID == 0 {
+            return None;
+        }
+        if entry & TABLE_OR_PAGE == 0 {
+            return Some(entry);
+        }
+        table = Frame::from_addr(entry & ADDR_MASK);
+    }
+
+    let entry = read_entry(table, table_index(va, 3));
+    (entry & VALID != 0).then_some(entry)
+}
+
+/// Could EL0 read every byte of `va..va + len` through `root`?
+///
+/// This is the question a syscall has to answer about a pointer it was handed,
+/// and it is not the same as "can the kernel read it". The kernel can read
+/// plenty this task cannot. Reading the access permission bits out of the
+/// task's own tables asks the hardware's question rather than a convenient
+/// approximation of it.
+pub fn user_readable(root: Frame, va: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    // Reject the whole low half boundary case before doing arithmetic that
+    // could wrap. A length chosen to overflow the addition is exactly the sort
+    // of argument this function exists to refuse.
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    if end > KERNEL_BASE {
+        return false;
+    }
+
+    let mut page = va & !(PAGE_SIZE - 1);
+    while page < end {
+        let Some(entry) = lookup(root, page) else {
+            return false;
+        };
+
+        // AP is two bits: the low one says writable, the high one says EL0 may
+        // touch it at all. 0b01 and 0b11 are the EL0-accessible encodings.
+        let ap = (entry >> AP_SHIFT) & 0b11;
+        if ap != AP_RW_ALL && ap != AP_RO_ALL {
+            return false;
+        }
+
+        page += PAGE_SIZE;
+    }
+
+    true
+}

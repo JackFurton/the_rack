@@ -74,6 +74,12 @@ impl VectorIndex {
     pub fn is_irq(&self) -> bool {
         self.0 & 0b11 == 1
     }
+
+    /// Did this come from a less privileged level? The last two groups of four
+    /// are the lower-EL entries, which until EL0 existed were unreachable.
+    pub fn from_lower_el(&self) -> bool {
+        (self.0 >> 2) >= 2
+    }
 }
 
 impl fmt::Display for VectorIndex {
@@ -208,6 +214,22 @@ pub fn vector_base() -> u64 {
     base
 }
 
+/// SVC from AArch64.
+const EC_SVC64: u64 = 0x15;
+/// The architecture's "unknown reason", which is what an instruction that is
+/// simply undefined at the current level reports.
+const EC_UNKNOWN: u64 = 0x00;
+/// Trapped MSR, MRS, or other system instruction.
+const EC_TRAPPED_SYSTEM: u64 = 0x18;
+
+/// How many times a lower EL has been refused a privileged instruction.
+static PRIVILEGED_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of privileged instructions refused to EL0.
+pub fn privileged_traps() -> u64 {
+    PRIVILEGED_TRAPS.load(Ordering::Relaxed)
+}
+
 /// Set while a probe is deliberately touching memory it may not be allowed to.
 static EXPECTING_FAULT: AtomicBool = AtomicBool::new(false);
 /// `ESR_EL1` from the probe's fault, or 0 if it did not fault.
@@ -271,6 +293,32 @@ pub extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     }
 
     let syndrome = Syndrome(frame.esr);
+
+    // A syscall. ELR_EL1 already points past the `svc`, because the hardware
+    // advances it for a synchronous exception raised by an instruction that
+    // completed. Stepping it again, as the BRK path below does, would silently
+    // skip whatever follows every syscall.
+    if syndrome.exception_class() == EC_SVC64 {
+        crate::syscall::dispatch(frame);
+        return;
+    }
+
+    // A less privileged task tried to execute something it may not. That is
+    // the boundary working, not a failure, so count it and step over the
+    // instruction rather than killing anything.
+    //
+    // Both classes matter and they are not interchangeable. EC 0x18 is a
+    // *configurable* trap: a register EL0 could otherwise reach, which a
+    // higher level has asked to be told about. A register EL0 simply may not
+    // access, like SCTLR_EL1, is not trapped at all, it is undefined at that
+    // level, and reports the architecture's EC 0x00. Checking only for 0x18
+    // catches none of the ordinary privilege violations.
+    if index.from_lower_el() && matches!(syndrome.exception_class(), EC_UNKNOWN | EC_TRAPPED_SYSTEM)
+    {
+        PRIVILEGED_TRAPS.fetch_add(1, Ordering::Relaxed);
+        frame.elr += 4;
+        return;
+    }
 
     // A probe deliberately touched something it was not allowed to. Record it,
     // step over the offending instruction, and carry on. This is how the

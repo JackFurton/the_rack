@@ -86,6 +86,7 @@ struct Task {
     /// Base of the kernel stack, kept so it can be handed back later.
     stack: Frame,
     state: State,
+    exit_code: Option<u64>,
 }
 
 struct Scheduler {
@@ -196,6 +197,7 @@ pub fn init() {
         // the field is not a lie, and never freed.
         stack: Frame::from_addr(0x4000_0000),
         state: State::Runnable,
+        exit_code: None,
     });
     scheduler.current = 0;
 }
@@ -245,6 +247,7 @@ pub fn spawn_in(
         sp,
         stack,
         state: State::Runnable,
+        exit_code: None,
     });
 
     TaskId(slot)
@@ -654,4 +657,161 @@ pub fn isolation_self_test() {
 
     print!("isolation self test: passed, ");
     println!("{ISOLATION_WORKERS} tasks each read their own value back from {ISOLATION_VA:#x}");
+}
+
+// --- EL0 ---
+
+/// Where user text is mapped in every user address space.
+const USER_TEXT_VA: u64 = 0x0040_0000;
+/// Top of the user stack. Grows down into the page below.
+const USER_STACK_TOP: u64 = 0x0080_0000;
+
+unsafe extern "C" {
+    static user_program_start: u8;
+    static user_program_end: u8;
+}
+
+/// Drop to EL0 and start running `entry`.
+///
+/// # Safety
+///
+/// `entry` and `stack` must be mapped executable and writable respectively in
+/// the address space currently in `TTBR0_EL1`.
+unsafe fn enter_el0(entry: u64, stack: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "msr sp_el0, {stack}",
+            "msr elr_el1, {entry}",
+            "msr spsr_el1, {spsr}",
+            "eret",
+            stack = in(reg) stack,
+            entry = in(reg) entry,
+            // All zero: M[3:0] = 0b0000 selects EL0t, and clear DAIF leaves
+            // interrupts unmasked. A user task with interrupts masked could
+            // never be preempted, which is the same bug the trampoline had.
+            spsr = in(reg) 0u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// Kernel side of a user task: set up EL0 and never come back.
+///
+/// A user task is still a kernel task underneath. It keeps its kernel stack,
+/// which is what `SP_EL1` points at when a syscall or an interrupt brings it
+/// back up to EL1.
+extern "C" fn user_task_entry(entry: u64) {
+    unsafe { enter_el0(entry, USER_STACK_TOP) }
+}
+
+/// Create a task that runs the embedded user program at EL0.
+pub fn spawn_user(name: &'static str) -> TaskId {
+    let space = AddressSpace::new();
+
+    let start = (&raw const user_program_start) as u64;
+    let end = (&raw const user_program_end) as u64;
+    let len = (end - start) as usize;
+    assert!(
+        len as u64 <= FRAME_SIZE,
+        "user program does not fit in a page"
+    );
+
+    // Copied rather than mapped from the kernel image, because the kernel's
+    // copy is mapped PXN-clear and EL0-inaccessible, and because user code
+    // must live at an address of the task's own.
+    let text = frames::alloc().expect("no frame for user text");
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            start as *const u8,
+            paging::phys_to_virt(text.addr()) as *mut u8,
+            len,
+        );
+    }
+    space.map(
+        USER_TEXT_VA,
+        text.addr(),
+        FRAME_SIZE,
+        paging::Attributes::user_text(),
+    );
+
+    let stack = frames::alloc().expect("no frame for a user stack");
+    space.map(
+        USER_STACK_TOP - FRAME_SIZE,
+        stack.addr(),
+        FRAME_SIZE,
+        paging::Attributes::user_data(),
+    );
+
+    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space))
+}
+
+/// Root of the current task's address space, if it has one.
+pub fn current_space_root() -> Option<Frame> {
+    let scheduler = SCHEDULER.lock();
+    scheduler.tasks[scheduler.current]
+        .as_ref()?
+        .space
+        .as_ref()
+        .map(AddressSpace::root)
+}
+
+/// End the current task.
+///
+/// Never returns. The kernel stack under our feet belongs to this task, so it
+/// cannot be reclaimed from here; that is #20's problem.
+pub fn exit_current(code: u64) -> ! {
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        if let Some(task) = scheduler.tasks[current].as_mut() {
+            task.state = State::Finished;
+            task.exit_code = Some(code);
+        }
+    }
+
+    loop {
+        yield_now();
+    }
+}
+
+/// What a finished task exited with.
+pub fn exit_code(id: TaskId) -> Option<u64> {
+    SCHEDULER.lock().tasks[id.0].as_ref()?.exit_code
+}
+
+fn finished(id: TaskId) -> bool {
+    matches!(
+        SCHEDULER.lock().tasks[id.0].as_ref(),
+        Some(task) if task.state == State::Finished
+    )
+}
+
+/// Run the embedded program at EL0 and check the privilege boundary held.
+pub fn user_self_test() {
+    let traps_before = crate::exceptions::privileged_traps();
+
+    let id = spawn_user("user");
+    while !finished(id) {
+        yield_now();
+    }
+
+    let code = exit_code(id).expect("user task finished without an exit code");
+    let traps = crate::exceptions::privileged_traps() - traps_before;
+
+    // -2 is EFAULT. The task asked the kernel to print from an address in the
+    // kernel's own half. The kernel can read there; the task cannot. Serving
+    // that request would be the kernel lending out its privilege.
+    const EFAULT: u64 = -2i64 as u64;
+    assert_eq!(
+        code, EFAULT,
+        "syscall accepted a kernel pointer from EL0 and returned {code}"
+    );
+
+    assert_eq!(
+        traps, 1,
+        "expected exactly one privileged instruction to be refused, saw {traps}"
+    );
+
+    print!("user self test: passed, ");
+    println!("EL0 ran, {traps} privileged instruction refused, kernel pointer rejected");
 }

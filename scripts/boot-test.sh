@@ -47,6 +47,12 @@ EXPECTED=(
     # Each task reading back its own value from one shared virtual address is
     # the property; a single address space cannot produce it.
     "isolation self test: passed"
+    # Printed by code running at EL0, through the write syscall. Nothing in
+    # the kernel prints this string.
+    "hello from EL0, running unprivileged"
+    "user self test: passed"
+    "kernel pointer rejected"
+    "tier 2: EL0 and syscalls online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
