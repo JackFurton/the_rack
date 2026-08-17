@@ -53,6 +53,10 @@ EXPECTED=(
     "user self test: passed"
     "kernel pointer rejected"
     "tier 2: EL0 and syscalls online"
+    # The frame count returning to its starting value is the whole assertion.
+    # A leak is otherwise something you notice months later.
+    "lifecycle self test: passed"
+    "gave back all"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

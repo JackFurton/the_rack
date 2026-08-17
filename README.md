@@ -66,6 +66,7 @@ preemption self test: passed, 82 switches, 58 of them preemptive, 4 tasks schedu
 isolation self test: passed, 3 tasks each read their own value back from 0x10000000
 hello from EL0, running unprivileged
 user self test: passed, EL0 ran, 1 privileged instruction refused, kernel pointer rejected
+lifecycle self test: passed, task took 11 frames and gave back all 11
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 
@@ -138,6 +139,13 @@ trapped and belongs to userspace.
 **Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
+
+**Why exiting is two steps.** A task cannot free its own kernel stack: it is
+standing on it. So exiting marks the task a zombie and switches away, and the
+stack and address space are released later by whichever task happens to run
+next, for which that memory is just memory. The table slot and the exit code
+outlive the reaping, so a task that has exited can still be asked how it went,
+which is the same reason Unix has zombies at all.
 
 **Why a user pointer is checked against the caller's page tables.** A syscall
 argument is a number the task chose, and the kernel is running with enough
