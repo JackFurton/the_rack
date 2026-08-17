@@ -66,3 +66,24 @@ user_program_start:
 
     .balign 4
 user_program_end:
+
+// A program that gets itself killed.
+//
+// Deliberately separate from the working one, so the fault path can be tested
+// without the well behaved program having to misbehave.
+    .section .text.user, "ax"
+    .global user_fault_start
+    .global user_fault_end
+
+user_fault_start:
+    // Dereference null. Nothing is mapped at zero in any address space, which
+    // is the whole reason the identity map was retired when paging came up.
+    mov     x0, xzr
+    str     x0, [x0]
+
+    // The kernel must never let us reach here.
+.Lnever:
+    b       .Lnever
+
+    .balign 4
+user_fault_end:

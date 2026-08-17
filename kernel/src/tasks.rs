@@ -19,6 +19,7 @@
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::exceptions::Fault;
 use crate::frames::{self, FRAME_SIZE, Frame};
 use crate::paging::{self, AddressSpace};
 use crate::sync::{self, Lock};
@@ -75,6 +76,13 @@ pub enum State {
     /// Resources returned to the allocator. Only the table slot and the exit
     /// code remain, so the exit code can still be collected.
     Dead,
+    /// Stopped because it did something it was not allowed to.
+    ///
+    /// Distinct from a zombie on purpose. A faulted task keeps its stack and
+    /// address space, because the point of catching the fault rather than
+    /// panicking is that somebody may want to look at the wreckage or put the
+    /// task back together. Reaping deliberately leaves these alone.
+    Faulted,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,6 +109,7 @@ struct Task {
     owns_stack: bool,
     state: State,
     exit_code: Option<u64>,
+    fault: Option<Fault>,
 }
 
 struct Scheduler {
@@ -213,6 +222,7 @@ pub fn init() {
         owns_stack: false,
         state: State::Runnable,
         exit_code: None,
+        fault: None,
     });
     scheduler.current = 0;
 }
@@ -264,6 +274,7 @@ pub fn spawn_in(
         owns_stack: true,
         state: State::Runnable,
         exit_code: None,
+        fault: None,
     });
 
     TaskId(slot)
@@ -696,6 +707,8 @@ const USER_STACK_TOP: u64 = 0x0080_0000;
 unsafe extern "C" {
     static user_program_start: u8;
     static user_program_end: u8;
+    static user_fault_start: u8;
+    static user_fault_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.
@@ -731,45 +744,22 @@ extern "C" fn user_task_entry(entry: u64) {
     unsafe { enter_el0(entry, USER_STACK_TOP) }
 }
 
-/// Create a task that runs the embedded user program at EL0.
+/// Create a task that runs the well behaved user program at EL0.
 pub fn spawn_user(name: &'static str) -> TaskId {
-    let space = AddressSpace::new();
+    spawn_user_program(
+        name,
+        (&raw const user_program_start) as u64,
+        (&raw const user_program_end) as u64,
+    )
+}
 
-    let start = (&raw const user_program_start) as u64;
-    let end = (&raw const user_program_end) as u64;
-    let len = (end - start) as usize;
-    assert!(
-        len as u64 <= FRAME_SIZE,
-        "user program does not fit in a page"
-    );
-
-    // Copied rather than mapped from the kernel image, because the kernel's
-    // copy is mapped PXN-clear and EL0-inaccessible, and because user code
-    // must live at an address of the task's own.
-    let text = frames::alloc().expect("no frame for user text");
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            start as *const u8,
-            paging::phys_to_virt(text.addr()) as *mut u8,
-            len,
-        );
-    }
-    space.map(
-        USER_TEXT_VA,
-        text.addr(),
-        FRAME_SIZE,
-        paging::Attributes::user_text(),
-    );
-
-    let stack = frames::alloc().expect("no frame for a user stack");
-    space.map(
-        USER_STACK_TOP - FRAME_SIZE,
-        stack.addr(),
-        FRAME_SIZE,
-        paging::Attributes::user_data(),
-    );
-
-    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space))
+/// Create a task running the program that deliberately faults.
+pub fn spawn_faulting_user(name: &'static str) -> TaskId {
+    spawn_user_program(
+        name,
+        (&raw const user_fault_start) as u64,
+        (&raw const user_fault_end) as u64,
+    )
 }
 
 /// Root of the current task's address space, if it has one.
@@ -990,4 +980,178 @@ fn free_slots() -> usize {
         .iter()
         .filter(|t| t.is_none())
         .count()
+}
+
+/// Stop the current task because it faulted. Never returns.
+///
+/// Called from the exception handler while still on the task's kernel stack,
+/// so this behaves like `exit_current`: mark, switch away, and never come
+/// back. The task is never scheduled again, which is what makes returning to
+/// the faulting instruction impossible and therefore what stops the fault
+/// repeating forever.
+pub fn fault_current(fault: Fault) -> ! {
+    let (id, name) = {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        let task = scheduler.tasks[current]
+            .as_mut()
+            .expect("a fault arrived with no current task");
+        task.state = State::Faulted;
+        task.fault = Some(fault);
+        (current, task.name)
+    };
+
+    let syndrome = fault.syndrome();
+    println!();
+    println!("--- task fault ---");
+    println!("  task   : {id} ({name})");
+    println!("  class  : {}", syndrome.class_name());
+    if syndrome.is_abort() {
+        print!("  fault  : {}", syndrome.fault_status());
+        if let Some(level) = syndrome.fault_level() {
+            print!(" at level {level}");
+        }
+        println!(
+            ", on a {}",
+            if syndrome.is_write() { "write" } else { "read" }
+        );
+        println!("  address: {:#018x}", fault.far);
+    }
+    println!("  pc     : {:#018x}", fault.elr);
+    println!("  the kernel is fine. this task is not.");
+    println!("------------------");
+
+    loop {
+        yield_now();
+    }
+}
+
+/// What killed a task, if something did.
+pub fn fault_of(id: TaskId) -> Option<Fault> {
+    SCHEDULER.lock().tasks[id.0].as_ref()?.fault
+}
+
+fn is_faulted(id: TaskId) -> bool {
+    matches!(
+        SCHEDULER.lock().tasks[id.0].as_ref(),
+        Some(task) if task.state == State::Faulted
+    )
+}
+
+/// Give up on a faulted task and let the reaper have its memory.
+///
+/// Separate from faulting so that stopping a task and discarding it are
+/// different decisions. A supervisor will want to inspect, and eventually
+/// restart, rather than always destroy.
+pub fn kill(id: TaskId) {
+    let mut scheduler = SCHEDULER.lock();
+    if let Some(task) = scheduler.tasks[id.0].as_mut()
+        && task.state == State::Faulted
+    {
+        task.state = State::Zombie;
+    }
+}
+
+/// Copy a user program blob into a fresh address space and spawn it at EL0.
+fn spawn_user_program(name: &'static str, start: u64, end: u64) -> TaskId {
+    let space = AddressSpace::new();
+
+    let len = (end - start) as usize;
+    assert!(
+        len as u64 <= FRAME_SIZE,
+        "user program does not fit in a page"
+    );
+
+    let text = frames::alloc().expect("no frame for user text");
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            start as *const u8,
+            paging::phys_to_virt(text.addr()) as *mut u8,
+            len,
+        );
+    }
+    space.map(
+        USER_TEXT_VA,
+        text.addr(),
+        FRAME_SIZE,
+        paging::Attributes::user_text(),
+    );
+
+    let stack = frames::alloc().expect("no frame for a user stack");
+    space.map(
+        USER_STACK_TOP - FRAME_SIZE,
+        stack.addr(),
+        FRAME_SIZE,
+        paging::Attributes::user_data(),
+    );
+
+    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space))
+}
+
+/// Check that an unprivileged task can kill itself without killing anything
+/// else.
+pub fn fault_self_test() {
+    reap_zombies();
+    release_dead();
+
+    let before_frames = frames::free_frames();
+    let ticks_before = crate::timer::ticks();
+
+    let id = spawn_faulting_user("faulter");
+    while !is_faulted(id) {
+        yield_now();
+    }
+
+    let fault = fault_of(id).expect("faulted task recorded no fault");
+    let syndrome = fault.syndrome();
+
+    assert!(
+        syndrome.is_abort(),
+        "expected a memory abort, got {}",
+        syndrome.class_name()
+    );
+    assert_eq!(
+        fault.far, 0,
+        "expected the faulting address to be the null that was dereferenced"
+    );
+
+    // Reaching this line at all is most of the point: the kernel is still
+    // executing after an unprivileged task did something fatal. The tick count
+    // says the rest of the system kept running too, rather than the machine
+    // limping on with the timer wedged.
+    //
+    // Waited for rather than sampled, because the fault and its cleanup take
+    // well under one 10 ms tick, so an immediate comparison measures nothing.
+    // Bounded so a genuinely dead timer fails here instead of hanging the boot
+    // and being diagnosed as a timeout.
+    let mut spins = 0u32;
+    while crate::timer::ticks() == ticks_before && spins < 10_000_000 {
+        spins += 1;
+        core::hint::black_box(spins);
+    }
+
+    let ticks_after = crate::timer::ticks();
+    assert!(
+        ticks_after > ticks_before,
+        "the timer never ticked again after a task faulted"
+    );
+
+    kill(id);
+    while !is_dead(id) {
+        yield_now();
+    }
+    release_dead();
+
+    assert_eq!(
+        frames::free_frames(),
+        before_frames,
+        "a faulted task did not give its memory back once killed"
+    );
+
+    print!("fault self test: passed, ");
+    println!(
+        "task died on {}, kernel survived, {} ticks elapsed meanwhile",
+        syndrome.fault_status(),
+        ticks_after - ticks_before
+    );
 }

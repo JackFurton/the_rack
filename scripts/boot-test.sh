@@ -57,6 +57,11 @@ EXPECTED=(
     # A leak is otherwise something you notice months later.
     "lifecycle self test: passed"
     "gave back all"
+    # A task killing itself must not kill the kernel. Everything after this
+    # line in the log is proof the machine kept running.
+    "the kernel is fine. this task is not."
+    "fault self test: passed"
+    "tier 3: task faults are contained"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
