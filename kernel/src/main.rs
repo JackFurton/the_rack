@@ -6,6 +6,7 @@
 #![no_main]
 
 pub mod exceptions;
+pub mod frames;
 pub mod gic;
 pub mod semihosting;
 pub mod sync;
@@ -44,8 +45,14 @@ pub extern "C" fn kernel_main() -> ! {
     println!("  vector table    : {:#018x}", exceptions::vector_base());
     println!();
 
+    frames::init();
+    println!();
+    frames::print_map();
+    println!();
+
     exceptions::self_test();
     sync::self_test();
+    frames::self_test();
 
     // Interrupt controller first: unmasking IRQs in PSTATE achieves nothing
     // until something is willing to forward one.
