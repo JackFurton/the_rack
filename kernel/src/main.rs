@@ -11,6 +11,7 @@ pub mod gic;
 pub mod paging;
 pub mod semihosting;
 pub mod sync;
+pub mod syscall;
 pub mod tasks;
 pub mod timer;
 pub mod uart;
@@ -20,6 +21,7 @@ use core::panic::PanicInfo;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
+global_asm!(include_str!("user.S"));
 
 unsafe extern "C" {
     static __kernel_end: u8;
@@ -127,7 +129,9 @@ extern "C" fn kernel_main_high() -> ! {
     // Needs live interrupts, so it cannot run with the other self tests.
     tasks::preemption_self_test();
     tasks::isolation_self_test();
+    tasks::user_self_test();
     println!("tier 2: preemptive scheduling online.");
+    println!("tier 2: EL0 and syscalls online.");
     println!();
 
     halt()

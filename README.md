@@ -64,7 +64,10 @@ tier 1: heartbeat started, interrupts live.
 
 preemption self test: passed, 82 switches, 58 of them preemptive, 4 tasks scheduled
 isolation self test: passed, 3 tasks each read their own value back from 0x10000000
+hello from EL0, running unprivileged
+user self test: passed, EL0 ran, 1 privileged instruction refused, kernel pointer rejected
 tier 2: preemptive scheduling online.
+tier 2: EL0 and syscalls online.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -135,6 +138,22 @@ trapped and belongs to userspace.
 **Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
+
+**Why a user pointer is checked against the caller's page tables.** A syscall
+argument is a number the task chose, and the kernel is running with enough
+privilege to honour any lie told with one. Checking that a pointer "looks like"
+a user address is not enough, because the kernel can read plenty the caller
+cannot. The question is not whether the address is low, it is whether *this
+task* is allowed to touch it, which means walking the task's own tables and
+reading the permissions the hardware would have enforced had the access come
+from EL0.
+
+**Why an EL0 privilege violation reports EC 0x00 and not EC 0x18.** EC 0x18 is
+a *configurable* trap: a register EL0 could otherwise reach, which a higher
+level asked to be told about. A register EL0 simply may not access, like
+`SCTLR_EL1`, is not trapped at all. It is undefined at that level, and reports
+the architecture's "unknown reason". Checking only for 0x18 catches none of the
+ordinary privilege violations.
 
 **Why the kernel has no low half of its own.** Task 0 is the kernel, it lives
 entirely above `KERNEL_BASE`, and it runs with an empty `TTBR0`. Tasks without
@@ -223,7 +242,9 @@ kernel/
     gic.rs        GICv2 distributor and CPU interface
     paging.rs     page tables, permissions, the move to the high half
     switch.S      the callee-saved swap that changes which task is running
-    tasks.rs      kernel tasks and cooperative yielding
+    tasks.rs      kernel tasks, scheduling, address spaces, EL0 entry
+    syscall.rs    the SVC interface and its argument checking
+    user.S        the program that runs at EL0
     timer.rs      generic timer, the 100 Hz heartbeat
     semihosting.rs asking QEMU to shut the machine down
 scripts/

@@ -164,6 +164,15 @@ unsafe fn raw_put(base: usize, byte: u8) {
     }
 }
 
+/// Write a string to the console, taking the lock for the whole thing.
+///
+/// Used by the write syscall, which already has bytes and does not need
+/// formatting.
+pub fn write_str(text: &str) {
+    use fmt::Write;
+    let _ = CONSOLE.lock().write_str(text);
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
