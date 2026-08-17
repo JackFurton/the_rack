@@ -40,6 +40,10 @@ EXPECTED=(
     # tasks ran. Right order with wrong values means the switch lost state.
     "task self test: passed"
     "locals intact"
+    # Preemptive switches specifically. The spinners contain no yield, so each
+    # one is the timer taking the CPU from something not finished with it.
+    "preemption self test: passed"
+    "tier 2: preemptive scheduling online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

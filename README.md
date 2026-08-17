@@ -62,6 +62,9 @@ tier 1: exception vectors online.
 tier 1: paging online, kernel in the high half.
 tier 1: heartbeat started, interrupts live.
 
+preemption self test: passed, 76 switches, 53 of them preemptive, 4 tasks scheduled
+tier 2: preemptive scheduling online.
+
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
 uptime 3s (300 ticks)
@@ -131,6 +134,16 @@ trapped and belongs to userspace.
 **Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
 and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
 the DTB intact for tier 4.
+
+**Why a new task must start with interrupts enabled.** `yield_now` always
+switches with interrupts masked, and restores the mask from a local on its own
+stack once it is running again. A task that has never run has no saved mask to
+restore, because it has never been through the second half of `switch`, so it
+inherits whatever the task that created it happened to be holding. The result
+is a task that can never be preempted. This is hard to notice because it looks
+like a working scheduler: tasks still run, still finish, still hand off in
+order. Only counting the switches gives it away. `task_trampoline` clears the
+mask before calling the entry point.
 
 **Why a cooperative context switch saves so little.** Under AAPCS64 the
 compiler already treats a function call as destroying `x0` through `x18`, so at

@@ -126,6 +126,11 @@ pub fn on_tick() {
     if count.is_multiple_of(TICK_HZ) {
         println!("uptime {}s ({} ticks)", count / TICK_HZ, count);
     }
+
+    // Ask for a reschedule rather than switching here. The GIC still has this
+    // interrupt active, and switching before releasing it would stop the timer
+    // for whichever task we switched to.
+    crate::tasks::request_reschedule();
 }
 
 /// Ticks recorded so far.

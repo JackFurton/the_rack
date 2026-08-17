@@ -58,6 +58,16 @@ switch:
 // holding whatever we planted in their saved slots.
     .global task_trampoline
 task_trampoline:
+    // Start with interrupts on.
+    //
+    // A task that has never run has no saved interrupt state to restore,
+    // because it has never been through the second half of `switch`. Without
+    // this it inherits whatever mask the task that created it happened to be
+    // holding, and `yield_now` always switches with interrupts masked. The
+    // result is a task that runs forever and can never be preempted, which
+    // looks exactly like a scheduler that works until you count the switches.
+    msr     daifclr, #0b0011
+
     mov     x0, x20         // the task's argument
     blr     x19             // the task's entry point
 

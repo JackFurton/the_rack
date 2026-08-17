@@ -321,6 +321,9 @@ fn dispatch_irq() {
     }
 
     crate::gic::end_of_interrupt(intid);
+
+    // Only now, with the interrupt released, is it safe to run something else.
+    crate::tasks::preempt_if_needed();
 }
 
 fn report(frame: &TrapFrame, index: VectorIndex, syndrome: Syndrome) {

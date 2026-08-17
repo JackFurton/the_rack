@@ -121,6 +121,11 @@ extern "C" fn kernel_main_high() -> ! {
     println!("tier 1: heartbeat started, interrupts live.");
     println!();
 
+    // Needs live interrupts, so it cannot run with the other self tests.
+    tasks::preemption_self_test();
+    println!("tier 2: preemptive scheduling online.");
+    println!();
+
     halt()
 }
 
