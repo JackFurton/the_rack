@@ -20,7 +20,7 @@ use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::frames::{self, FRAME_SIZE, Frame};
-use crate::paging;
+use crate::paging::{self, AddressSpace};
 use crate::sync::{self, Lock};
 use crate::{print, println};
 
@@ -45,7 +45,13 @@ const STACK_SIZE: u64 = STACK_FRAMES as u64 * FRAME_SIZE;
 /// Cheap, and turns silent overflow into something we can actually see.
 const STACK_CANARY: u64 = 0x5441_434b_5f43_414e; // "TACK_CAN"
 
-const MAX_TASKS: usize = 8;
+/// Task table size.
+///
+/// Sized for the self tests rather than for anything real, because a finished
+/// task holds its slot forever right now. Reclaiming slots is #20; until then
+/// this number has to cover every task the kernel has ever created, not every
+/// task alive at once.
+const MAX_TASKS: usize = 16;
 
 /// Offsets within the 96 byte frame `switch.S` pushes, in u64 units.
 ///
@@ -68,6 +74,12 @@ pub struct TaskId(pub usize);
 
 struct Task {
     name: &'static str,
+    /// The task's low half address space, if it has one.
+    ///
+    /// Task 0 does not. It is the kernel, it lives entirely in the high half,
+    /// and giving it a low half would only create somewhere for a stray
+    /// pointer to land quietly.
+    space: Option<AddressSpace>,
     /// Where this task's saved switch frame lives. Only meaningful while the
     /// task is not running.
     sp: u64,
@@ -178,6 +190,7 @@ pub fn init() {
     let mut scheduler = SCHEDULER.lock();
     scheduler.tasks[0] = Some(Task {
         name: "kernel",
+        space: None,
         sp: 0,
         // Task 0's stack came from the linker, not the allocator. Recorded so
         // the field is not a lie, and never freed.
@@ -194,6 +207,16 @@ pub fn init() {
 /// `switch` would have pushed, with `x30` pointing at the trampoline and the
 /// entry point and argument sitting in the saved `x19` and `x20` slots.
 pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId {
+    spawn_in(name, entry, arg, None)
+}
+
+/// Create a task that runs in its own address space.
+pub fn spawn_in(
+    name: &'static str,
+    entry: extern "C" fn(u64),
+    arg: u64,
+    space: Option<AddressSpace>,
+) -> TaskId {
     let stack = frames::alloc_contiguous(STACK_FRAMES).expect("no frames for a kernel stack");
 
     let stack_base = paging::phys_to_virt(stack.addr());
@@ -218,6 +241,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId 
     let slot = scheduler.free_slot().expect("task table is full");
     scheduler.tasks[slot] = Some(Task {
         name,
+        space,
         sp,
         stack,
         state: State::Runnable,
@@ -250,7 +274,7 @@ pub fn yield_now() {
 /// Must be called with interrupts already masked. Shared by the voluntary and
 /// the preemptive paths, which differ only in how they got here.
 fn switch_to_next(reason: Reason) {
-    let (save_to, resume) = {
+    let (save_to, resume, root) = {
         let mut scheduler = SCHEDULER.lock();
 
         // Nothing to switch between before `init` has run.
@@ -272,12 +296,44 @@ fn switch_to_next(reason: Reason) {
         // static that never moves, and because interrupts are masked for the
         // whole window, so nothing else can reach the table in between.
         let save_to = &mut scheduler.tasks[current].as_mut().unwrap().sp as *mut u64;
-        let resume = scheduler.tasks[next].as_ref().unwrap().sp;
+        let incoming = scheduler.tasks[next].as_ref().unwrap();
+        let resume = incoming.sp;
+        let root = incoming.space.as_ref().map(AddressSpace::root);
 
-        (save_to, resume)
+        (save_to, resume, root)
     };
 
+    // Swap the low half before swapping stacks. Safe in either order, because
+    // kernel stacks live in the high half and TTBR1 is untouched by this;
+    // doing it first just keeps the window where TTBR0 and the stack disagree
+    // out of the switch itself.
+    unsafe { paging::activate_root(root.unwrap_or_else(empty_space_root)) };
+
     unsafe { switch(save_to, resume) };
+}
+
+/// Root of the address space used by tasks that have none of their own.
+///
+/// Empty, so every low address faults. A task without an address space should
+/// find nothing down there rather than inheriting whatever the previous task
+/// had mapped, which is the difference between "no address space" and "someone
+/// else's address space".
+fn empty_space_root() -> Frame {
+    EMPTY_SPACE
+        .lock()
+        .as_ref()
+        .expect("address spaces not initialised")
+        .root()
+}
+
+static EMPTY_SPACE: Lock<Option<AddressSpace>> = Lock::new(None);
+
+/// Give the scheduler an empty low half to fall back on, and let the walker
+/// consult TTBR0 again.
+pub fn init_address_spaces() {
+    *EMPTY_SPACE.lock() = Some(AddressSpace::new());
+    unsafe { paging::activate_root(empty_space_root()) };
+    unsafe { paging::enable_user_translation() };
 }
 
 /// Set by the timer handler to ask for a reschedule.
@@ -533,4 +589,69 @@ pub fn preemption_self_test() {
 
     print!("preemption self test: passed, ");
     println!("{total} switches, {preemptions} of them preemptive, {distinct} tasks scheduled");
+}
+
+/// Virtual address every isolation worker maps, each to a different frame.
+///
+/// The same address deliberately. Two tasks reading different values from one
+/// address is the whole property; if they had different addresses the test
+/// would prove nothing that a single address space could not also do.
+const ISOLATION_VA: u64 = 0x1000_0000;
+
+const ISOLATION_WORKERS: u64 = 3;
+
+static ISOLATION_SEEN: Lock<[u64; MAX_TASKS]> = Lock::new([0; MAX_TASKS]);
+static ISOLATION_DONE: Lock<u64> = Lock::new(0);
+
+extern "C" fn isolation_worker(tag: u64) {
+    // Write our own tag into what should be our own private page.
+    unsafe { core::ptr::write_volatile(ISOLATION_VA as *mut u64, tag) };
+
+    // Let every other worker write theirs. If TTBR0 is not being switched,
+    // this is the window in which they overwrite each other.
+    for _ in 0..ISOLATION_WORKERS * 2 {
+        yield_now();
+    }
+
+    let seen = unsafe { core::ptr::read_volatile(ISOLATION_VA as *const u64) };
+
+    ISOLATION_SEEN.lock()[tag as usize] = seen;
+    *ISOLATION_DONE.lock() += 1;
+}
+
+/// Prove that address spaces are private.
+pub fn isolation_self_test() {
+    *ISOLATION_DONE.lock() = 0;
+
+    for tag in 1..=ISOLATION_WORKERS {
+        let space = AddressSpace::new();
+        let frame = frames::alloc().expect("no frame for a user page");
+        space.map(
+            ISOLATION_VA,
+            frame.addr(),
+            FRAME_SIZE,
+            paging::Attributes::user_data(),
+        );
+        spawn_in("iso", isolation_worker, tag, Some(space));
+    }
+
+    while *ISOLATION_DONE.lock() < ISOLATION_WORKERS {
+        yield_now();
+    }
+
+    let seen = ISOLATION_SEEN.lock();
+    for tag in 1..=ISOLATION_WORKERS {
+        let got = seen[tag as usize];
+        assert_eq!(
+            got, tag,
+            "task {tag} read {got} back from {ISOLATION_VA:#x}; \
+             the address space was not private"
+        );
+    }
+    drop(seen);
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+
+    print!("isolation self test: passed, ");
+    println!("{ISOLATION_WORKERS} tasks each read their own value back from {ISOLATION_VA:#x}");
 }

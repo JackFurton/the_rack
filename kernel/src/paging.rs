@@ -74,7 +74,9 @@ const UXN: u64 = 1 << 54;
 
 // Access permissions, bits [7:6].
 const AP_RW_EL1: u64 = 0b00;
+const AP_RW_ALL: u64 = 0b01;
 const AP_RO_EL1: u64 = 0b10;
+const AP_RO_ALL: u64 = 0b11;
 
 // Shareability, bits [9:8].
 const SH_NON_SHAREABLE: u64 = 0b00;
@@ -580,4 +582,127 @@ pub fn self_test() {
     println!("  write to .text   : {}", write_text.describe());
     println!("  write to .rodata : {}", write_rodata.describe());
     println!("  read low half    : {}", low_half.describe());
+}
+
+impl Attributes {
+    /// User data: readable and writable at both EL0 and EL1, never executable.
+    pub const fn user_data() -> Self {
+        Self(
+            (MAIR_NORMAL_INDEX << ATTR_INDEX_SHIFT)
+                | (AP_RW_ALL << AP_SHIFT)
+                | (SH_INNER_SHAREABLE << SH_SHIFT)
+                | AF
+                | UXN
+                | PXN,
+        )
+    }
+
+    /// User code: executable at EL0, read-only, and explicitly *not*
+    /// executable by the kernel.
+    ///
+    /// PXN matters more than it looks. Without it, any kernel bug that
+    /// redirects control flow into a user-controlled page executes attacker
+    /// chosen instructions with full privilege.
+    pub const fn user_text() -> Self {
+        Self(
+            (MAIR_NORMAL_INDEX << ATTR_INDEX_SHIFT)
+                | (AP_RO_ALL << AP_SHIFT)
+                | (SH_INNER_SHAREABLE << SH_SHIFT)
+                | AF
+                | PXN,
+        )
+    }
+}
+
+/// A low half address space, the thing `TTBR0_EL1` points at.
+///
+/// One per task. Switching tasks swaps this and leaves `TTBR1_EL1` alone,
+/// which is the entire reason the kernel was moved to the high half in #5:
+/// changing address spaces cannot disturb the kernel's own mappings.
+pub struct AddressSpace {
+    root: Frame,
+}
+
+impl Default for AddressSpace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AddressSpace {
+    /// An address space with nothing in it. Every low address faults.
+    pub fn new() -> Self {
+        Self {
+            root: frames::alloc().expect("no frame for an address space root"),
+        }
+    }
+
+    pub fn map(&self, va: u64, pa: u64, size: u64, attrs: Attributes) {
+        assert!(
+            va < KERNEL_BASE,
+            "an address space only covers the low half; {va:#x} belongs to the kernel"
+        );
+        map_range(self.root, va, pa, size, attrs);
+    }
+
+    pub fn root(&self) -> Frame {
+        self.root
+    }
+}
+
+/// Make `root` the current low half address space.
+///
+/// # Safety
+///
+/// `root` must be a valid level 0 table, and the caller must not be executing
+/// from or relying on any low address across the change.
+pub unsafe fn activate_root(root: Frame) {
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {root}",
+            "dsb ish",
+            // Invalidates every stage 1 entry for EL1&0, kernel mappings
+            // included, which is heavier than it needs to be. ASIDs are the
+            // right answer: tag each address space and invalidate only its
+            // entries. Worth doing when there is enough switching for it to
+            // matter, and noted here so the current choice is a decision
+            // rather than an oversight.
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            root = in(reg) root.addr(),
+            options(nostack),
+        );
+    }
+}
+
+/// Let the walker consult `TTBR0_EL1` again.
+///
+/// Enabling the MMU set `TCR_EL1.EPD0` to retire the identity map, which turned
+/// every low address into a translation fault. Now that address spaces exist,
+/// low addresses have to be translatable again, so the protection comes from
+/// the tables rather than from refusing to walk them at all. A task with no
+/// address space gets an empty root, which faults on everything just the same.
+///
+/// # Safety
+///
+/// `TTBR0_EL1` must already point at a valid level 0 table. Clearing `EPD0`
+/// tells the walker to start trusting that register, so calling this while it
+/// holds a stale or arbitrary value hands the walker whatever happens to be
+/// there to interpret as page tables.
+pub unsafe fn enable_user_translation() {
+    unsafe {
+        let mut tcr: u64;
+        asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack));
+        tcr &= !(1 << 7);
+        asm!(
+            "msr tcr_el1, {tcr}",
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            tcr = in(reg) tcr,
+            options(nostack),
+        );
+    }
 }
