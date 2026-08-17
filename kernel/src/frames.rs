@@ -185,6 +185,61 @@ pub fn alloc() -> Option<Frame> {
     Some(frame)
 }
 
+/// Take `count` physically consecutive frames, zeroed.
+///
+/// Needed for anything that has to be contiguous in physical memory rather
+/// than merely contiguous in virtual memory: a kernel stack that we want to
+/// reason about as one range, and eventually DMA buffers, where the device
+/// does not go through our page tables at all.
+///
+/// Linear scan. At 65536 frames that is cheap and only happens at task
+/// creation, and it stays honest about fragmentation rather than hiding it.
+pub fn alloc_contiguous(count: usize) -> Option<Frame> {
+    assert!(count > 0);
+
+    let mut allocator = ALLOCATOR.lock();
+
+    let mut run_start = 0;
+    let mut run = 0;
+
+    for index in 0..FRAME_COUNT {
+        if allocator.is_set(index) {
+            run = 0;
+            continue;
+        }
+
+        if run == 0 {
+            run_start = index;
+        }
+        run += 1;
+
+        if run < count {
+            continue;
+        }
+
+        for taken in run_start..run_start + count {
+            allocator.set(taken);
+        }
+        allocator.free -= count;
+        drop(allocator);
+
+        let frame = Frame::from_index(run_start);
+        unsafe {
+            core::ptr::write_bytes(frame.as_mut_ptr(), 0, count * FRAME_SIZE as usize);
+        }
+        return Some(frame);
+    }
+
+    None
+}
+
+/// Hand back `count` frames starting at `first`.
+pub fn free_contiguous(first: Frame, count: usize) {
+    for index in 0..count {
+        free(Frame::from_addr(first.addr() + index as u64 * FRAME_SIZE));
+    }
+}
+
 /// Hand a frame back.
 ///
 /// Panics on a frame outside RAM or one that is already free. Both mean a bug
