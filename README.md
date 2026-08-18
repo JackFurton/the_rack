@@ -81,12 +81,14 @@ priority self test: passed, high ran to completion before low, blocked task skip
 ipc: server received ping
 ipc self test: passed, message and reply survived both directions across two address spaces
 lease self test: passed, buffer lent and written across address spaces
+supervisor self test: passed, task faulted, supervisor restarted it with clean memory
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
 tier 3: priority scheduling and blocking online.
 tier 3: synchronous IPC online.
 tier 3: leases online.
+tier 3: supervised restart online.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -365,6 +367,39 @@ because an empty slot permits nothing. A test that only looks for a nonzero
 return therefore passes with the index bound deleted. The self test compares
 against the specific error each refusal should produce, which turns "something
 said no" into "the check that should have said no is the one that did".
+
+**Why a restart keeps the task's id and nothing else.** Everything about a
+restarted task is thrown away except the one thing anybody else might be
+holding. The address space is destroyed and rebuilt from the program image, so
+the task cannot come back to find its own wreckage; every frame comes from the
+allocator zeroed. The kernel stack is reused rather than returned and re-asked
+for, because a faulted task is never scheduled and so nobody is standing on it,
+and winding it back to a never-run switch frame is the whole of what "fresh
+stack" means here. The slot stays, which is what makes this a restart rather
+than a replacement: anything holding the task's id still refers to that task.
+
+**Why a dying task wakes people without switching to them.** `unblock` hands
+the CPU straight over when the woken task outranks the caller, which is exactly
+right for a reply and exactly wrong for a task on its way out. `fault_current`
+is already marked as faulted by the time it wakes anybody, so the first switch
+it makes is the last one it will ever make, and everything it had left to do
+would simply never happen. It has two things left: releasing whoever was
+blocked sending to it, and telling the supervisor. With an immediate wakeup,
+whichever came second was lost, and which one that was depended on priorities.
+`unblock_deferred` marks the task runnable and returns.
+
+**Why the supervisor needs no queue of faults.** `fault_wait` blocks until some
+task is faulted, then scans the task table and names one. A faulted task stays
+faulted until somebody deals with it, so the table *is* the backlog: two faults
+while the supervisor is busy are two tasks sitting in it, not one event that
+overwrote another. Nothing can be missed by not being collected in time, which
+is the failure mode a queue would have introduced along with a size to pick.
+
+**Why the privilege check comes before the argument check.** `fault_info` and
+`restart` refuse a caller that is not the supervisor before they look at what
+was asked. The other order leaks the answer: a task told "no such faulted task"
+has learned that there is no such faulted task, which is the thing it was not
+supposed to be able to find out.
 
 ## Layout
 

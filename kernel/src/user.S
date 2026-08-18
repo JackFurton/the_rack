@@ -601,3 +601,171 @@ user_borrower_start:
 
     .balign 4
 user_borrower_end:
+
+// Supervision: a task that faults, a task watching it, and a bystander.
+//
+// The kernel's part in a fault ends at "stop this task and say so". What to do
+// about it is policy, and policy belongs in a task. The supervisor is the one
+// task allowed to ask what happened and to put a broken task back together.
+
+.set SYS_FAULT_WAIT, 9
+.set SYS_FAULT_INFO, 10
+.set SYS_RESTART,    11
+
+.set EDEAD, -3
+
+// The victim's scratch word, in its own stack page. A restart must not leave
+// anything of the old instance here.
+.set MARKER_OFFSET, 32
+
+    .section .text.user, "ax"
+    .global user_victim_start
+    .global user_victim_end
+
+user_victim_start:
+    sub     sp, sp, #64
+    add     x19, sp, #MARKER_OFFSET
+
+    // Whether this instance is starting on clean memory is decided here, by
+    // reading before writing. A restart that handed back the same page with
+    // the same contents would be caught by the fault address changing, which
+    // the supervisor checks.
+    ldr     x0, [x19]
+    cbnz    x0, .Lvictim_dirty
+
+    mov     x0, #1
+    str     x0, [x19]
+
+    // Fault at address zero.
+    mov     x1, xzr
+    str     x1, [x1]
+
+.Lvictim_dirty:
+    // Fault at address eight instead, so the supervisor can tell "restarted
+    // with clean memory" from "restarted into its own leftovers" without
+    // either instance being able to report anything itself.
+    mov     x1, #8
+    str     x1, [x1]
+
+.Lvictim_stuck:
+    b       .Lvictim_stuck
+
+    .balign 4
+user_victim_end:
+
+    .section .text.user, "ax"
+    .global user_supervisor_start
+    .global user_supervisor_end
+
+user_supervisor_start:
+    ldr     x19, [sp, #8]           // the task we are expected to look after
+    mov     x21, #0                 // accumulated failures
+
+    // Wait for the first fault and check it is the one we expected.
+    mov     x8, #SYS_FAULT_WAIT
+    svc     #0
+    mov     x20, x0
+    cmp     x20, x19
+    b.eq    .Lsup_info_one
+    orr     x21, x21, #1
+
+.Lsup_info_one:
+    mov     x8, #SYS_FAULT_INFO
+    mov     x0, x20
+    svc     #0
+    // x1 is the faulting address. The first fault is at zero.
+    cbz     x1, .Lsup_restart
+    orr     x21, x21, #2
+
+.Lsup_restart:
+    mov     x8, #SYS_RESTART
+    mov     x0, x20
+    svc     #0
+    cbz     x0, .Lsup_wait_two
+    orr     x21, x21, #4
+
+.Lsup_wait_two:
+    // The restarted task runs again from the top, so it faults again. Getting
+    // here at all is the proof that it ran.
+    mov     x8, #SYS_FAULT_WAIT
+    svc     #0
+    cmp     x0, x20
+    b.eq    .Lsup_info_two
+    // A different task, which means the restart produced a new identity rather
+    // than the same task over again.
+    orr     x21, x21, #8
+
+.Lsup_info_two:
+    mov     x8, #SYS_FAULT_INFO
+    mov     x0, x20
+    svc     #0
+    // Zero again means the restarted task read zero out of its scratch word,
+    // so the memory it came back with was clean.
+    cbz     x1, .Lsup_exit
+    orr     x21, x21, #16
+
+.Lsup_exit:
+    mov     x8, #SYS_EXIT
+    mov     x0, x21
+    svc     #0
+.Lsup_stuck:
+    b       .Lsup_stuck
+
+    .balign 4
+user_supervisor_end:
+
+    .section .text.user, "ax"
+    .global user_petitioner_start
+    .global user_petitioner_end
+
+// A task that was in the middle of talking to the victim when it died.
+//
+// It sends to a task that never receives, so it is still blocked when the
+// victim faults. Being told the other end is gone is the only acceptable
+// outcome; waiting forever for a reply from a task that no longer exists is
+// the failure this exists to rule out.
+user_petitioner_start:
+    ldr     x19, [sp, #8]
+    sub     sp, sp, #64
+    mov     x20, sp
+    mov     x21, #0
+
+    mov     x8, #SYS_SEND
+    mov     x0, x19
+    mov     x1, #0x70
+    adr     x2, .Lpetition
+    mov     x3, #(.Lpetition_end - .Lpetition)
+    mov     x4, x20
+    mov     x5, #16
+    mov     x6, xzr
+    mov     x7, xzr
+    svc     #0
+    mov     x9, #EDEAD
+    cmp     x0, x9
+    b.eq    .Lpet_privilege
+    orr     x21, x21, #1
+
+.Lpet_privilege:
+    // Restarting somebody else's task is the supervisor's business, and this
+    // task is not the supervisor.
+    mov     x8, #SYS_RESTART
+    mov     x0, x19
+    svc     #0
+    mov     x9, #EPERM
+    cmp     x0, x9
+    b.eq    .Lpet_exit
+    orr     x21, x21, #2
+
+.Lpet_exit:
+    mov     x8, #SYS_EXIT
+    mov     x0, x21
+    svc     #0
+.Lpet_stuck:
+    b       .Lpet_stuck
+
+.Lpetition:
+    .ascii  "are you there"
+.Lpetition_end:
+
+    .balign 4
+user_petitioner_end:

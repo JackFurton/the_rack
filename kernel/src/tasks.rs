@@ -157,6 +157,20 @@ struct Task {
     state: State,
     exit_code: Option<u64>,
     fault: Option<Fault>,
+    /// Everything needed to build this task again from nothing.
+    ///
+    /// Only user tasks have one. A kernel task is a function pointer into an
+    /// image that is already running, and there is nothing to rebuild; a user
+    /// task is a blob plus an argument, which is exactly a recipe.
+    image: Option<Image>,
+}
+
+/// How to reconstruct a user task.
+#[derive(Clone, Copy)]
+struct Image {
+    start: u64,
+    end: u64,
+    arg: u64,
 }
 
 struct Scheduler {
@@ -296,6 +310,7 @@ pub fn init() {
         state: State::Runnable,
         exit_code: None,
         fault: None,
+        image: None,
     });
     scheduler.current = 0;
 }
@@ -329,7 +344,35 @@ pub fn spawn_in(
     priority: Priority,
 ) -> TaskId {
     let stack = frames::alloc_contiguous(STACK_FRAMES).expect("no frames for a kernel stack");
+    let sp = plant_switch_frame(stack, entry, arg);
 
+    let mut scheduler = SCHEDULER.lock();
+    let slot = scheduler.free_slot().expect("task table is full");
+    scheduler.tasks[slot] = Some(Task {
+        name,
+        space,
+        sp,
+        stack,
+        owns_stack: true,
+        priority,
+        state: State::Runnable,
+        exit_code: None,
+        fault: None,
+        image: None,
+    });
+
+    TaskId(slot)
+}
+
+/// Lay a fresh, never-run switch frame on a kernel stack and return the `sp`
+/// that resumes it.
+///
+/// Separate from spawning because restarting a task needs exactly this and
+/// nothing else around it: the stack it already owns, wound back to look like
+/// a task that has never run. Nobody is standing on it, since a faulted task is
+/// never scheduled, so overwriting it is safe and reusing the frames it already
+/// has avoids handing memory back only to ask for it again.
+fn plant_switch_frame(stack: Frame, entry: extern "C" fn(u64), arg: u64) -> u64 {
     let stack_base = paging::phys_to_virt(stack.addr());
     let stack_top = stack_base + STACK_SIZE;
 
@@ -348,21 +391,7 @@ pub fn spawn_in(
         core::ptr::write_volatile(frame.add(SLOT_X30), task_trampoline as *const () as u64);
     }
 
-    let mut scheduler = SCHEDULER.lock();
-    let slot = scheduler.free_slot().expect("task table is full");
-    scheduler.tasks[slot] = Some(Task {
-        name,
-        space,
-        sp,
-        stack,
-        owns_stack: true,
-        priority,
-        state: State::Runnable,
-        exit_code: None,
-        fault: None,
-    });
-
-    TaskId(slot)
+    sp
 }
 
 /// Give up the CPU to the next runnable task.
@@ -457,26 +486,37 @@ pub fn park() {
 pub fn unblock(id: TaskId) {
     let state = sync::disable_interrupts();
 
-    let outranks = {
-        let mut scheduler = SCHEDULER.lock();
-        let current = scheduler.current;
-        let running = scheduler.tasks[current].as_ref().map(|task| task.priority);
-
-        match scheduler.tasks[id.0].as_mut() {
-            Some(task) if task.state == State::Blocked => {
-                task.state = State::Runnable;
-                let woken = task.priority;
-                running.is_some_and(|running| woken.outranks(running))
-            }
-            _ => false,
-        }
-    };
-
-    if outranks {
+    if unblock_deferred(id) {
         switch_to_next(Reason::Voluntary);
     }
 
     sync::restore_interrupts(state);
+}
+
+/// Put a blocked task back in the running without giving up the CPU.
+///
+/// Returns whether the woken task outranks the caller, so a caller that wants
+/// the handoff can make it and one that does not can carry on.
+///
+/// Not an optimisation. `unblock` may never return, because the switch it makes
+/// can be to a task that runs for a long time, and a caller with more than one
+/// thing left to do would silently leave the rest undone. `fault_current` is
+/// the extreme case: it is already marked as faulted when it wakes anybody, so
+/// every switch it makes is permanent and everything it still has to do would
+/// simply never happen.
+pub fn unblock_deferred(id: TaskId) -> bool {
+    let mut scheduler = SCHEDULER.lock();
+    let current = scheduler.current;
+    let running = scheduler.tasks[current].as_ref().map(|task| task.priority);
+
+    match scheduler.tasks.get_mut(id.0).and_then(Option::as_mut) {
+        Some(task) if task.state == State::Blocked => {
+            task.state = State::Runnable;
+            let woken = task.priority;
+            running.is_some_and(|running| woken.outranks(running))
+        }
+        _ => false,
+    }
 }
 
 /// Can this task still be sent to?
@@ -1127,6 +1167,115 @@ pub fn lease_self_test() {
     );
 }
 
+fn supervisor_failures(code: u64) -> &'static str {
+    match code {
+        1 => "the fault reported was not the task being watched",
+        2 => "the first fault was not at the address the victim aimed at",
+        4 => "restart was refused",
+        8 => "the restarted task came back with a different identity",
+        16 => "the restarted task found its old memory still there",
+        _ => "several checks failed at once",
+    }
+}
+
+/// A task dies, a task notices, and the task comes back.
+pub fn supervisor_self_test() {
+    reap_zombies();
+    release_dead();
+    let before_frames = frames::free_frames();
+
+    let (victim, supervisor, petitioner) = sync::without_interrupts(|| {
+        let victim = spawn_user_program(
+            "victim",
+            (&raw const user_victim_start) as u64,
+            (&raw const user_victim_end) as u64,
+            0,
+            Priority::NORMAL,
+        );
+        // Above the victim, so it is already blocked mid conversation when the
+        // victim dies. A petitioner that had not sent yet would be told the
+        // target is dead by the ordinary liveness check and would prove
+        // nothing about releasing somebody who is already waiting.
+        let petitioner = spawn_user_program(
+            "petitioner",
+            (&raw const user_petitioner_start) as u64,
+            (&raw const user_petitioner_end) as u64,
+            victim.0 as u64,
+            Priority::HIGH,
+        );
+        // Also above the victim, so it is already parked in `fault_wait` when
+        // the fault happens. It would work either way, since a faulted task
+        // stays faulted and asking late finds it just the same, but only this
+        // order tests the wake: a supervisor that asks afterwards never needed
+        // waking and would pass with the notification broken.
+        let supervisor = spawn_user_program(
+            "supervisor",
+            (&raw const user_supervisor_start) as u64,
+            (&raw const user_supervisor_end) as u64,
+            victim.0 as u64,
+            Priority::HIGH,
+        );
+        set_supervisor(supervisor);
+        (victim, supervisor, petitioner)
+    });
+
+    let deadline = crate::timer::ticks() + 200;
+    while !finished(supervisor) || !finished(petitioner) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "supervision never finished; the supervisor is waiting for a fault that never came, \
+             or somebody is stuck on a task that died"
+        );
+        yield_now();
+    }
+
+    let supervisor_code = exit_code(supervisor).expect("supervisor finished without an exit code");
+    let petitioner_code = exit_code(petitioner).expect("petitioner finished without an exit code");
+
+    assert_eq!(
+        supervisor_code,
+        0,
+        "supervision failed: {}",
+        supervisor_failures(supervisor_code)
+    );
+    assert_eq!(
+        petitioner_code,
+        0,
+        "{}",
+        match petitioner_code {
+            1 => "a task blocked sending to the victim was not released when it died",
+            _ => "a task that is not the supervisor was allowed to restart another task",
+        }
+    );
+
+    // The victim is still sitting there faulted for the second time, which is
+    // the supervisor deciding it has seen enough. Giving up on it is the other
+    // half of the policy, and it is the kernel's job only because there is
+    // nobody left to ask.
+    assert!(
+        is_faulted(victim),
+        "the victim should still be stopped after its second fault"
+    );
+    kill(victim);
+    while !is_dead(victim) {
+        yield_now();
+    }
+    release_dead();
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+    assert_eq!(
+        frames::free_frames(),
+        before_frames,
+        "a restart leaked memory; the address space it replaced was not given back"
+    );
+
+    print!("supervisor self test: passed, ");
+    println!(
+        "task faulted, supervisor restarted it with clean memory and the same id, \
+         blocked sender released, restart refused to everybody else"
+    );
+}
+
 // --- priorities and blocking ---
 
 /// Who ran, in the order they ran. The assertion for this tier is about
@@ -1342,6 +1491,12 @@ unsafe extern "C" {
     static user_lender_end: u8;
     static user_borrower_start: u8;
     static user_borrower_end: u8;
+    static user_victim_start: u8;
+    static user_victim_end: u8;
+    static user_supervisor_start: u8;
+    static user_supervisor_end: u8;
+    static user_petitioner_start: u8;
+    static user_petitioner_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.
@@ -1649,8 +1804,6 @@ pub fn fault_current(fault: Fault) -> ! {
         (current, task.name)
     };
 
-    crate::ipc::abandon(TaskId(id));
-
     let syndrome = fault.syndrome();
     println!();
     println!("--- task fault ---");
@@ -1671,6 +1824,15 @@ pub fn fault_current(fault: Fault) -> ! {
     println!("  the kernel is fine. this task is not.");
     println!("------------------");
 
+    // Both of these wake without giving up the CPU, and that is the whole
+    // reason they can both be here. This task is already marked as faulted, so
+    // the first switch it makes is the last one it ever makes: an immediate
+    // handoff to the first task woken would leave everything after it undone,
+    // which in this order means either a stranded sender or a supervisor that
+    // never hears what happened, depending on which line went first.
+    crate::ipc::abandon(TaskId(id));
+    wake_fault_waiters();
+
     loop {
         yield_now();
     }
@@ -1688,6 +1850,132 @@ fn is_faulted(id: TaskId) -> bool {
     )
 }
 
+// --- supervision ---
+
+/// The one task allowed to hear about faults and act on them.
+///
+/// Designated by the kernel rather than claimed by a task, because "who is in
+/// charge" is not a question a task should be able to answer about itself.
+static SUPERVISOR: Lock<Option<TaskId>> = Lock::new(None);
+
+/// Which tasks are parked in `wait_for_fault`.
+///
+/// A separate flag rather than another `State` variant, for the same reason
+/// IPC keeps its own table: the scheduler only needs to know a task is blocked.
+/// Why it is blocked belongs to whoever will wake it.
+static FAULT_WAITERS: Lock<[bool; MAX_TASKS]> = Lock::new([false; MAX_TASKS]);
+
+pub fn set_supervisor(id: TaskId) {
+    *SUPERVISOR.lock() = Some(id);
+}
+
+pub fn is_supervisor(id: TaskId) -> bool {
+    *SUPERVISOR.lock() == Some(id)
+}
+
+/// The lowest numbered task currently stopped by a fault.
+fn first_faulted() -> Option<TaskId> {
+    let scheduler = SCHEDULER.lock();
+    scheduler
+        .tasks
+        .iter()
+        .position(|task| matches!(task, Some(task) if task.state == State::Faulted))
+        .map(TaskId)
+}
+
+/// Block until some task is faulted, then name it.
+///
+/// There is no queue behind this and there does not need to be one. A faulted
+/// task stays faulted until somebody deals with it, so the state of the task
+/// table *is* the backlog: the scan finds whatever is still outstanding, and
+/// nothing can be missed by not being collected in time. Two faults while the
+/// supervisor is busy are two tasks sitting in the table, not one event that
+/// overwrote another.
+///
+/// The caller is expected to do something about what it is told. A supervisor
+/// that asks and then ignores the answer gets the same answer forever.
+pub fn wait_for_fault() -> u64 {
+    let state = sync::disable_interrupts();
+
+    let id = loop {
+        if let Some(id) = first_faulted() {
+            break id;
+        }
+
+        let me = SCHEDULER.lock().current;
+        FAULT_WAITERS.lock()[me] = true;
+        mark_current_blocked();
+        park();
+        FAULT_WAITERS.lock()[me] = false;
+    };
+
+    sync::restore_interrupts(state);
+    id.0 as u64
+}
+
+/// Wake everybody waiting to hear about a fault, without giving up the CPU.
+fn wake_fault_waiters() {
+    for slot in 0..MAX_TASKS {
+        if FAULT_WAITERS.lock()[slot] {
+            unblock_deferred(TaskId(slot));
+        }
+    }
+}
+
+/// Put a faulted task back at its entry point with clean memory.
+///
+/// Keeps the slot, and therefore the identity: anything holding this task's id
+/// still refers to this task. That is the whole difference between a restart
+/// and a replacement, and it is why the id has to survive even though nothing
+/// else does.
+///
+/// The kernel stack is reused rather than returned and re-fetched. Nobody is
+/// standing on it, because a faulted task is never scheduled, so winding it
+/// back to a never-run switch frame is enough. The address space is not reused:
+/// it is destroyed and rebuilt, so the restarted task cannot find anything the
+/// old instance left behind.
+pub fn restart(id: TaskId) -> bool {
+    // Anybody waiting on the instance that is going away has to be told, not
+    // left holding a conversation with a task that is about to forget it ever
+    // happened. Already done when the fault was taken, and done again here so
+    // that restarting is correct on its own terms rather than only as a
+    // follow-up to something else that happened to clean up first.
+    crate::ipc::abandon(id);
+
+    let (image, stack, old_space) = {
+        let mut scheduler = SCHEDULER.lock();
+        let Some(task) = scheduler.tasks.get_mut(id.0).and_then(Option::as_mut) else {
+            return false;
+        };
+        if task.state != State::Faulted {
+            return false;
+        }
+        let Some(image) = task.image else {
+            return false;
+        };
+        (image, task.stack, task.space.take())
+    };
+
+    // Outside the lock: both of these touch the frame allocator, and the
+    // scheduler lock has no business being held while that happens.
+    if let Some(old_space) = old_space {
+        old_space.destroy();
+    }
+    let space = build_user_space(image.start, image.end, image.arg);
+    let sp = plant_switch_frame(stack, user_task_entry, USER_TEXT_VA);
+
+    let mut scheduler = SCHEDULER.lock();
+    let Some(task) = scheduler.tasks.get_mut(id.0).and_then(Option::as_mut) else {
+        return false;
+    };
+    task.space = Some(space);
+    task.sp = sp;
+    task.fault = None;
+    task.exit_code = None;
+    task.state = State::Runnable;
+    true
+}
+
 /// Give up on a faulted task and let the reaper have its memory.
 ///
 /// Separate from faulting so that stopping a task and discarding it are
@@ -1702,14 +1990,13 @@ pub fn kill(id: TaskId) {
     }
 }
 
-/// Copy a user program blob into a fresh address space and spawn it at EL0.
-fn spawn_user_program(
-    name: &'static str,
-    start: u64,
-    end: u64,
-    arg: u64,
-    priority: Priority,
-) -> TaskId {
+/// Build a fresh address space holding a user program and its stack.
+///
+/// Every frame in it comes from the allocator zeroed, so a task built this way
+/// starts with memory that carries nothing from whatever used those frames
+/// before. That is what makes a restart a genuine restart rather than the same
+/// task waking up in its own wreckage.
+fn build_user_space(start: u64, end: u64, arg: u64) -> AddressSpace {
     let space = AddressSpace::new();
 
     let len = (end - start) as usize;
@@ -1749,7 +2036,27 @@ fn spawn_user_program(
         core::ptr::write_volatile((stack_top_alias - USER_ARG_OFFSET) as *mut u64, arg);
     }
 
-    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space), priority)
+    space
+}
+
+/// Copy a user program blob into a fresh address space and spawn it at EL0.
+fn spawn_user_program(
+    name: &'static str,
+    start: u64,
+    end: u64,
+    arg: u64,
+    priority: Priority,
+) -> TaskId {
+    let space = build_user_space(start, end, arg);
+    let id = spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space), priority);
+
+    // Recorded now rather than reconstructed later. A task that faults has
+    // nothing left to ask about how it was made.
+    if let Some(task) = SCHEDULER.lock().tasks[id.0].as_mut() {
+        task.image = Some(Image { start, end, arg });
+    }
+
+    id
 }
 
 /// Check that an unprivileged task can kill itself without killing anything
