@@ -80,11 +80,13 @@ fault self test: passed, task died on translation fault, kernel survived
 priority self test: passed, high ran to completion before low, blocked task skipped
 ipc: server received ping
 ipc self test: passed, message and reply survived both directions across two address spaces
+lease self test: passed, buffer lent and written across address spaces
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
 tier 3: priority scheduling and blocking online.
 tier 3: synchronous IPC online.
+tier 3: leases online.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -336,6 +338,33 @@ written it is waiting for nothing. Leaving the flag for the sender to clear
 when it next runs opened a window where the reply had been delivered but the
 sender still looked like it was waiting on its replier, and the replier exiting
 a few instructions later overwrote a perfectly good reply with `EDEAD`.
+
+**Why a lease can be validated once and never again.** A sender attaches
+regions of its own memory to a send, marked readable, writable, or both, and
+the kernel checks each one against the sender's page tables at send time only.
+In almost any other design that would be a stale check by the time anybody used
+it. Here it is exact, because a lease lives only while its owner is blocked on
+the send that carried it: the sender cannot be running to remap or free the
+memory underneath a borrow, since being blocked until the reply is what having
+sent *means*. The reply ends the send and the lease with it, and nothing has to
+be revoked, because nothing was ever handed out. The receiver only ever had an
+index, and an index into the lease table of a task that is no longer waiting
+means nothing.
+
+**Why the receiver gets an index and not a pointer.** `borrow_read` and
+`borrow_write` name a lease by number and ask the kernel to move the bytes. A
+receiver never holds an address in the sender's space and could do nothing with
+one if it did, which is the only reason it is safe to give it access to memory
+it must not be able to forge access to. Every borrow is bounded by the lease's
+own length, checked without wrapping, and refused outright if the direction was
+not lent.
+
+**Why "it was refused" is too weak a test.** A borrow with an out of range
+index hits an empty lease slot, which the *direction* check refuses on its own
+because an empty slot permits nothing. A test that only looks for a nonzero
+return therefore passes with the index bound deleted. The self test compares
+against the specific error each refusal should produce, which turns "something
+said no" into "the check that should have said no is the one that did".
 
 ## Layout
 

@@ -1038,6 +1038,95 @@ pub fn ipc_self_test() {
     );
 }
 
+/// What the borrower reports, one bit per check that was allowed and should
+/// not have been.
+fn lease_failures(code: u64) -> &'static str {
+    match code {
+        1 => "reading a lease it was given failed",
+        2 => "reading a lease produced the wrong bytes",
+        4 => "writing a lease it was given failed",
+        8 => "a borrow past the end of a lease was allowed",
+        16 => "writing a read only lease was allowed",
+        32 => "a lease index nobody lent it was accepted",
+        64 => "a borrow after the reply still worked",
+        _ => "several checks failed at once",
+    }
+}
+
+/// Lend memory across an address space boundary and check every way of
+/// abusing it is refused.
+pub fn lease_self_test() {
+    reap_zombies();
+    release_dead();
+    let before_frames = frames::free_frames();
+
+    let (borrower, lender) = sync::without_interrupts(|| {
+        let borrower = spawn_user_program(
+            "borrower",
+            (&raw const user_borrower_start) as u64,
+            (&raw const user_borrower_end) as u64,
+            0,
+            Priority::HIGH,
+        );
+        let lender = spawn_user_program(
+            "lender",
+            (&raw const user_lender_start) as u64,
+            (&raw const user_lender_end) as u64,
+            borrower.0 as u64,
+            Priority::NORMAL,
+        );
+        (borrower, lender)
+    });
+
+    let deadline = crate::timer::ticks() + 100;
+    while !finished(lender) || !finished(borrower) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the lease exchange never finished"
+        );
+        yield_now();
+    }
+
+    let borrower_code = exit_code(borrower).expect("borrower finished without an exit code");
+    let lender_code = exit_code(lender).expect("lender finished without an exit code");
+
+    reap_zombies();
+    release_dead();
+
+    assert_eq!(
+        borrower_code,
+        0,
+        "borrow check failed: {}",
+        lease_failures(borrower_code)
+    );
+
+    // The lender only gets here by finding, in its own memory, bytes that a
+    // task in another address space put there. That is the property.
+    assert_eq!(
+        lender_code,
+        0,
+        "{}",
+        match lender_code {
+            1 => "the borrower reported a refused borrow it should have been allowed",
+            3 => "a lease over memory the sender does not own was accepted",
+            _ => "the lent buffer did not come back with the borrower's bytes in it",
+        }
+    );
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+    assert_eq!(
+        frames::free_frames(),
+        before_frames,
+        "a lease exchange leaked memory"
+    );
+
+    print!("lease self test: passed, ");
+    println!(
+        "buffer lent and written across address spaces, overrun and wrong direction \
+         and unknown index and stale lease all refused"
+    );
+}
+
 // --- priorities and blocking ---
 
 /// Who ran, in the order they ran. The assertion for this tier is about
@@ -1249,6 +1338,10 @@ unsafe extern "C" {
     static user_client_end: u8;
     static user_server_start: u8;
     static user_server_end: u8;
+    static user_lender_start: u8;
+    static user_lender_end: u8;
+    static user_borrower_start: u8;
+    static user_borrower_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.

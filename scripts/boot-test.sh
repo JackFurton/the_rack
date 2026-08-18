@@ -75,6 +75,13 @@ EXPECTED=(
     "ipc self test: passed"
     "message and reply survived both directions"
     "tier 3: synchronous IPC online"
+    # Every clause here is a refusal that was checked for the right error code,
+    # not just for "some error". A zeroed lease slot is refused too, by a
+    # different check, so looking only for nonzero passes with the bound gone.
+    "lease self test: passed"
+    "buffer lent and written across address spaces"
+    "stale lease all refused"
+    "tier 3: leases online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

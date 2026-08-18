@@ -28,6 +28,8 @@ pub const SYS_GETPID: u64 = 3;
 pub const SYS_SEND: u64 = 4;
 pub const SYS_RECV: u64 = 5;
 pub const SYS_REPLY: u64 = 6;
+pub const SYS_BORROW_READ: u64 = 7;
+pub const SYS_BORROW_WRITE: u64 = 8;
 
 /// Returned for anything we do not recognise or will not do.
 ///
@@ -46,8 +48,14 @@ const MAX_WRITE: u64 = 4096;
 /// instruction follows every syscall.
 pub fn dispatch(frame: &mut TrapFrame) {
     let number = frame.x[8];
+    // Eight argument registers rather than the six Linux uses. `send` genuinely
+    // needs eight: a target, an operation, a message, a reply buffer, and a
+    // lease table are five things with a length each. Packing two of them into
+    // one register to hit a number borrowed from another kernel would buy
+    // nothing and cost a shift at both ends of every call.
     let a = [
-        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5], frame.x[6],
+        frame.x[7],
     ];
 
     // The message calls return two or three values, so results come back as a
@@ -60,11 +68,13 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_YIELD => (sys_yield(), 0, 0),
         SYS_GETPID => (sys_getpid(), 0, 0),
         SYS_SEND => {
-            let (rc, len) = ipc::send(a[0], a[1], a[2], a[3], a[4], a[5]);
+            let (rc, len) = ipc::send(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
             (rc, len, 0)
         }
         SYS_RECV => ipc::recv(a[0], a[1]),
         SYS_REPLY => (ipc::reply(a[0], a[1], a[2], a[3]), 0, 0),
+        SYS_BORROW_READ => (ipc::borrow_read(a[0], a[1], a[2], a[3], a[4]), 0, 0),
+        SYS_BORROW_WRITE => (ipc::borrow_write(a[0], a[1], a[2], a[3], a[4]), 0, 0),
         _ => (EINVAL, 0, 0),
     };
 
