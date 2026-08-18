@@ -11,8 +11,8 @@
 
 use core::arch::asm;
 
+use crate::gic;
 use crate::sync::Lock;
-use crate::{gic, println};
 
 /// The EL1 non-secure physical timer is PPI 14, which is interrupt ID 30.
 ///
@@ -116,16 +116,11 @@ pub fn on_tick() {
     // still know exactly where the last one was.
     arm_next();
 
-    let mut ticks = TICKS.lock();
-    *ticks += 1;
-    let count = *ticks;
-    // Release before printing: the console takes its own lock, and holding two
-    // locks at once is a habit worth not forming.
-    drop(ticks);
+    *TICKS.lock() += 1;
 
-    if count.is_multiple_of(TICK_HZ) {
-        println!("uptime {}s ({} ticks)", count / TICK_HZ, count);
-    }
+    // Nothing is printed here any more. The heartbeat is a driver's job, and
+    // the driver is a task: it is woken by a notification and reads the count
+    // back through a syscall, the same shape any device driver has.
 
     // Ask for a reschedule rather than switching here. The GIC still has this
     // interrupt active, and switching before releasing it would stop the timer

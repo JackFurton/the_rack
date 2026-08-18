@@ -52,6 +52,7 @@
 //! reading whatever is there now.
 
 use crate::frames::Frame;
+use crate::notify;
 use crate::paging;
 use crate::sync::{self, Lock};
 use crate::tasks::{self, MAX_TASKS, Priority, TaskId};
@@ -90,6 +91,15 @@ pub const EFAULT: u64 = -2i64 as u64;
 pub const EDEAD: u64 = -3i64 as u64;
 /// The lease is real, but it does not allow this.
 pub const EPERM: u64 = -4i64 as u64;
+
+/// Stands where a sender's task id would be when `recv` returns a notification
+/// instead of a message.
+///
+/// Not a task, and deliberately not a number that could ever become one. A
+/// receiver that treats it as a sender and tries to reply to it is refused by
+/// the ordinary range check, so mistaking one for the other costs an error
+/// rather than a reply delivered to a stranger.
+pub const NOTIFICATION: u64 = u64::MAX;
 
 /// One region a sender has lent for the duration of its send.
 #[derive(Clone, Copy)]
@@ -411,8 +421,19 @@ pub fn send(
     (outcome.a, outcome.b)
 }
 
-/// Block until somebody sends, then return `(sender, operation, len)`.
-pub fn recv(buf: u64, cap: u64) -> (u64, u64, u64) {
+/// Wait for a message or a notification, whichever comes first.
+///
+/// Returns `(sender, operation, len)` for a message, or `(NOTIFICATION, bits,
+/// 0)` for notifications. One wait point rather than two is the whole point: a
+/// driver that had to choose between waiting for its interrupt and waiting for
+/// a request would have to poll one of them, and a driver that polls its
+/// interrupt is not a driver.
+///
+/// Notifications are checked before senders. An interrupt is the machine saying
+/// something has already happened, and a request is a task asking for something
+/// to happen; when both are outstanding, the one that has already happened is
+/// the one with a deadline attached.
+pub fn recv(buf: u64, cap: u64, notify_mask: u64) -> (u64, u64, u64) {
     if cap > MAX_MESSAGE {
         return (EINVAL, 0, 0);
     }
@@ -425,6 +446,7 @@ pub fn recv(buf: u64, cap: u64) -> (u64, u64, u64) {
         return (EFAULT, 0, 0);
     }
 
+    let notify_mask = notify_mask as u32;
     let state = sync::disable_interrupts();
 
     // Loops rather than recurses, because each turn of it is a sender being
@@ -432,14 +454,35 @@ pub fn recv(buf: u64, cap: u64) -> (u64, u64, u64) {
     // Recursion here would put an attacker-chosen number of frames on a kernel
     // stack four pages deep.
     let result = loop {
+        let fired = notify::take(me, notify_mask);
+        if fired != 0 {
+            break (NOTIFICATION, fired as u64, 0);
+        }
+
         // Somebody may already be waiting. Take the best of them rather than
         // the first: senders queue by priority, so the most urgent request is
         // served first even if it arrived last. Scanning is fine at this table
         // size and avoids a second sorted structure to keep honest.
         let Some(sender) = best_sender(me) else {
+            notify::arm(me, notify_mask);
             TABLE.lock().pending[me.0] = Some(Pending::RecvWait { buf, cap });
             tasks::mark_current_blocked();
             tasks::park();
+            notify::disarm(me);
+
+            // Which of the two woke us is not recorded anywhere, and does not
+            // need to be. A sender clears this flag as it delivers, so finding
+            // it still set means no message arrived and something else did the
+            // waking. Reading it this way rather than being told keeps one
+            // owner for the flag, which is what an earlier version of this got
+            // wrong.
+            let delivered = TABLE.lock().pending[me.0].is_none();
+            if !delivered {
+                TABLE.lock().pending[me.0] = None;
+                // Round again, so a notification and a message racing are
+                // resolved by the same rules as any other pass.
+                continue;
+            }
 
             let outcome = core::mem::take(&mut TABLE.lock().outcome[me.0]);
             break (outcome.a, outcome.b, outcome.c);

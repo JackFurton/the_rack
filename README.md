@@ -82,6 +82,7 @@ ipc: server received ping
 ipc self test: passed, message and reply survived both directions across two address spaces
 lease self test: passed, buffer lent and written across address spaces
 supervisor self test: passed, task faulted, supervisor restarted it with clean memory
+notification self test: passed, unwanted bit did not wake the task and was kept
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
@@ -89,6 +90,7 @@ tier 3: priority scheduling and blocking online.
 tier 3: synchronous IPC online.
 tier 3: leases online.
 tier 3: supervised restart online.
+tier 3: notifications online, heartbeat now runs at EL0.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -400,6 +402,36 @@ is the failure mode a queue would have introduced along with a size to pick.
 was asked. The other order leaks the answer: a task told "no such faulted task"
 has learned that there is no such faulted task, which is the thing it was not
 supposed to be able to find out.
+
+**Why a notification is a bitmask and not a queue.** Two of the same event
+before the task gets a turn collapse into one bit. That is the contract, not a
+limitation waiting to be lifted: a notification says *something happened*,
+never *how many times*, and a driver that needs the count reads it from the
+device. A queue would need a length, and a length needs an answer to what
+happens when it fills. Drop the oldest, drop the newest, and block the
+interrupt handler are all worse than a bit that is already set, and all three
+make the kernel allocate on a path that runs with interrupts masked. A bit that
+is already set requires no decision at all.
+
+**Why the heartbeat reads the tick count instead of counting wakeups.** It is
+the demonstration of the paragraph above. The heartbeat task is woken by a bit
+and then asks the kernel how many ticks there have been. If it does not get a
+turn for five ticks it is woken once, so counting wakeups would drift and
+reading the count cannot. A notification it never saw costs it nothing.
+
+**Why the kernel still owns the timer.** Every other line could be handed to a
+task entirely. The timer cannot, because preemption is the scheduler's business
+and the scheduler is not a task. So the interrupt does two things: the kernel
+re-arms the deadline and asks for a reschedule, and the driver that got the
+notification decides what the tick *means*. The console heartbeat used to be
+four lines inside the interrupt handler and is now an unprivileged task that
+formats its own decimal.
+
+**Why routing an interrupt is not a syscall.** Which task owns which line is set
+by the kernel at startup. A task that could claim a line could take another
+task's device or silence it, and there is no way to tell a legitimate claim from
+a theft without something that already knows the intended shape of the system.
+The supervisor is where that will go.
 
 ## Layout
 
