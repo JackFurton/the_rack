@@ -63,9 +63,55 @@ const SLOT_X29: usize = 10;
 const SLOT_X30: usize = 11;
 const SWITCH_FRAME_WORDS: usize = 12;
 
+/// How important a task is. Lower number wins.
+///
+/// Backwards from intuition and deliberately so, because it is the convention
+/// everything else in this space uses: Hubris, ARM's own interrupt priorities,
+/// and Unix nice values all agree that smaller means more urgent. Flipping it
+/// to be friendlier would make every comparison against the GIC's priority
+/// registers read backwards, which is a worse trade than one surprising
+/// `<`.
+///
+/// Scheduling is strictly priority ordered, not time sliced across
+/// priorities: a runnable task at priority 0 runs, and a task at priority 1
+/// does not, however long it has been waiting. That is what makes latency
+/// something you can reason about instead of measure and hope. It also means
+/// starvation is a real outcome rather than a bug, and the fix is to not give
+/// a busy task a high priority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Priority(pub u8);
+
+impl Priority {
+    pub const HIGH: Self = Self(0);
+    pub const NORMAL: Self = Self(1);
+    pub const LOW: Self = Self(2);
+
+    /// Reserved for the idle task. Nothing else should sit here, because a
+    /// second task at this level would take turns with idle and the machine
+    /// would look busy while doing nothing.
+    pub const IDLE: Self = Self(u8::MAX);
+
+    /// Does `self` get the CPU ahead of `other`?
+    ///
+    /// A named method rather than a bare `<`, because `a < b` meaning "a is
+    /// more important than b" is exactly the sort of line that reads fine and
+    /// is understood wrongly.
+    pub fn outranks(self, other: Self) -> bool {
+        self.0 < other.0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Runnable,
+    /// Waiting for something that has not happened yet.
+    ///
+    /// Never a candidate for the CPU, no matter how high its priority. A
+    /// blocked task is not slow, it is absent: the scheduler passes over it
+    /// entirely and picks the best of what is left. Distinct from the finished
+    /// states because a blocked task is expected back, and still owns every
+    /// resource it had.
+    Blocked,
     /// Finished, but still holding its kernel stack and address space.
     ///
     /// A task cannot free its own kernel stack: it is standing on it. So
@@ -107,6 +153,7 @@ struct Task {
     /// would mark memory free that the kernel is still using, and the
     /// allocator would believe it.
     owns_stack: bool,
+    priority: Priority,
     state: State,
     exit_code: Option<u64>,
     fault: Option<Fault>,
@@ -129,18 +176,39 @@ impl Scheduler {
         self.tasks.iter().position(Option::is_none)
     }
 
-    /// Next runnable task after `current`, wrapping. Returns `current` itself
-    /// if nothing else can run.
-    fn next_runnable(&self) -> usize {
+    /// The best runnable task, or `None` if nothing at all can run.
+    ///
+    /// Best means highest priority, and among equals the one that has waited
+    /// longest. Both fall out of one scan: start just past `current` and keep
+    /// the first task of the best priority seen. Starting past `current`
+    /// rather than at slot 0 is what makes equal priorities round robin, and
+    /// visiting `current` last is what makes it lose ties to its peers instead
+    /// of hogging the CPU.
+    ///
+    /// `current` is only a candidate if it is still runnable. A task that just
+    /// blocked itself is sitting in this table with its own slot number in
+    /// `self.current`, and returning it would resume something that explicitly
+    /// asked not to run.
+    fn next_runnable(&self) -> Option<usize> {
+        let mut best: Option<(usize, Priority)> = None;
+
         for step in 1..=MAX_TASKS {
             let candidate = (self.current + step) % MAX_TASKS;
-            if let Some(task) = &self.tasks[candidate]
-                && task.state == State::Runnable
-            {
-                return candidate;
+            let Some(task) = &self.tasks[candidate] else {
+                continue;
+            };
+            if task.state != State::Runnable {
+                continue;
+            }
+
+            // Strictly outranks, so the earlier task in the scan keeps a tie.
+            match best {
+                Some((_, best_priority)) if !task.priority.outranks(best_priority) => {}
+                _ => best = Some((candidate, task.priority)),
             }
         }
-        self.current
+
+        best.map(|(slot, _)| slot)
     }
 }
 
@@ -220,6 +288,11 @@ pub fn init() {
         // the field is not a lie, and never freed.
         stack: Frame::from_addr(0x4000_0000),
         owns_stack: false,
+        // The kernel thread is the idle task. It is always runnable and always
+        // the least important thing in the table, so it gets the CPU exactly
+        // when nothing else can use it, which is the definition of idle. No
+        // separate idle task needed, and no special case in the picker.
+        priority: Priority::IDLE,
         state: State::Runnable,
         exit_code: None,
         fault: None,
@@ -234,7 +307,17 @@ pub fn init() {
 /// `switch` would have pushed, with `x30` pointing at the trampoline and the
 /// entry point and argument sitting in the saved `x19` and `x20` slots.
 pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId {
-    spawn_in(name, entry, arg, None)
+    spawn_in(name, entry, arg, None, Priority::NORMAL)
+}
+
+/// Create a task at a chosen priority.
+pub fn spawn_at(
+    name: &'static str,
+    entry: extern "C" fn(u64),
+    arg: u64,
+    priority: Priority,
+) -> TaskId {
+    spawn_in(name, entry, arg, None, priority)
 }
 
 /// Create a task that runs in its own address space.
@@ -243,6 +326,7 @@ pub fn spawn_in(
     entry: extern "C" fn(u64),
     arg: u64,
     space: Option<AddressSpace>,
+    priority: Priority,
 ) -> TaskId {
     let stack = frames::alloc_contiguous(STACK_FRAMES).expect("no frames for a kernel stack");
 
@@ -272,6 +356,7 @@ pub fn spawn_in(
         sp,
         stack,
         owns_stack: true,
+        priority,
         state: State::Runnable,
         exit_code: None,
         fault: None,
@@ -299,6 +384,76 @@ pub fn yield_now() {
     sync::restore_interrupts(state);
 }
 
+/// Take the current task out of the running until somebody puts it back.
+///
+/// Returns once `unblock` has been called on it. The difference from
+/// `yield_now` is the whole point: a yielding task is asking to go last, a
+/// blocking task is asking not to be considered at all. Priority does not
+/// rescue it. The highest priority task in the system, blocked, is passed over
+/// in favour of the lowest priority runnable one.
+pub fn block_current() {
+    let state = sync::disable_interrupts();
+
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        if let Some(task) = scheduler.tasks[current].as_mut() {
+            task.state = State::Blocked;
+        }
+    }
+
+    switch_to_next(Reason::Voluntary);
+
+    // By the time we are back, whoever woke us has already put the state back
+    // to Runnable. Doing it here instead would leave a window where a resumed
+    // task is still marked blocked.
+    sync::restore_interrupts(state);
+}
+
+/// Put a blocked task back in the running.
+///
+/// If the woken task outranks the caller, the caller loses the CPU on this
+/// line rather than at the next timer tick. That immediacy is the property the
+/// whole priority scheme exists for: "a high priority task runs as soon as it
+/// is runnable" is not true if it has to wait out the rest of somebody else's
+/// time slice. It does mean `unblock` is a scheduling point, so callers must
+/// not hold anything across it that the woken task might want.
+///
+/// Waking something that is not blocked does nothing, which keeps the caller
+/// from having to know whether it won a race to wake it.
+pub fn unblock(id: TaskId) {
+    let state = sync::disable_interrupts();
+
+    let outranks = {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        let running = scheduler.tasks[current].as_ref().map(|task| task.priority);
+
+        match scheduler.tasks[id.0].as_mut() {
+            Some(task) if task.state == State::Blocked => {
+                task.state = State::Runnable;
+                let woken = task.priority;
+                running.is_some_and(|running| woken.outranks(running))
+            }
+            _ => false,
+        }
+    };
+
+    if outranks {
+        switch_to_next(Reason::Voluntary);
+    }
+
+    sync::restore_interrupts(state);
+}
+
+/// Is this task waiting on something?
+pub fn is_blocked(id: TaskId) -> bool {
+    matches!(
+        SCHEDULER.lock().tasks[id.0].as_ref(),
+        Some(task) if task.state == State::Blocked
+    )
+}
+
 /// Pick the next runnable task and switch to it, if there is one.
 ///
 /// Must be called with interrupts already masked. Shared by the voluntary and
@@ -317,7 +472,14 @@ fn switch_to_next(reason: Reason) {
             return;
         }
 
-        let next = scheduler.next_runnable();
+        // Nothing runnable anywhere, including us. Only reachable if the idle
+        // task itself blocked, since it is otherwise always runnable. There is
+        // no correct task to pick and resuming a blocked one is worse than
+        // stopping, so say what happened rather than quietly running something
+        // that asked not to be run.
+        let next = scheduler
+            .next_runnable()
+            .expect("every task is blocked; nothing can run");
         if next == scheduler.current {
             return;
         }
@@ -464,10 +626,11 @@ pub fn print_table() {
     for (slot, task) in scheduler.tasks.iter().enumerate() {
         let Some(task) = task else { continue };
         println!(
-            "  {}{} {:<8} stack {:#012x}  {:?}",
+            "  {}{} {:<8} prio {:<3} stack {:#012x}  {:?}",
             slot,
             if slot == scheduler.current { "*" } else { " " },
             task.name,
+            task.priority.0,
             paging::phys_to_virt(task.stack.addr()),
             task.state
         );
@@ -672,7 +835,7 @@ pub fn isolation_self_test() {
             FRAME_SIZE,
             paging::Attributes::user_data(),
         );
-        spawn_in("iso", isolation_worker, tag, Some(space));
+        spawn_in("iso", isolation_worker, tag, Some(space), Priority::NORMAL);
     }
 
     while *ISOLATION_DONE.lock() < ISOLATION_WORKERS {
@@ -695,6 +858,189 @@ pub fn isolation_self_test() {
 
     print!("isolation self test: passed, ");
     println!("{ISOLATION_WORKERS} tasks each read their own value back from {ISOLATION_VA:#x}");
+}
+
+// --- priorities and blocking ---
+
+/// Who ran, in the order they ran. The assertion for this tier is about
+/// sequence, not about tasks merely having had a turn: a round robin scheduler
+/// also gives everybody a turn, which is exactly the thing being ruled out.
+const ORDER_LEN: usize = 16;
+
+struct Order {
+    tags: [u8; ORDER_LEN],
+    len: usize,
+}
+
+static ORDER: Lock<Order> = Lock::new(Order {
+    tags: [0; ORDER_LEN],
+    len: 0,
+});
+
+fn note_run(tag: u8) {
+    let mut order = ORDER.lock();
+    if order.len < ORDER_LEN {
+        let index = order.len;
+        order.tags[index] = tag;
+        order.len += 1;
+    }
+}
+
+fn reset_order() {
+    ORDER.lock().len = 0;
+}
+
+/// Number of turns each ladder worker takes.
+const LADDER_ROUNDS: usize = 3;
+
+/// Records its tag and yields, over and over.
+///
+/// It yields rather than spins so that the scheduler is asked to choose
+/// repeatedly. A yield is the friendliest thing a task can do, and a round
+/// robin scheduler would hand the CPU straight down to a low priority task on
+/// each one. A priority ordered scheduler gives it back to the same tier until
+/// that tier is empty.
+extern "C" fn ladder_worker(tag: u64) {
+    for _ in 0..LADDER_ROUNDS {
+        note_run(tag as u8);
+        yield_now();
+    }
+}
+
+/// Blocks itself immediately, at the highest priority in the test.
+///
+/// The priority is the trap. If blocked tasks were still candidates, this one
+/// would outrank everything and be picked every single time, and the waker
+/// below would never record anything at all.
+extern "C" fn sleeper(_arg: u64) {
+    note_run(1);
+    block_current();
+    note_run(3);
+}
+
+extern "C" fn waker(_arg: u64) {
+    note_run(2);
+
+    let id = SLEEPER.lock().expect("sleeper was never registered");
+    assert!(
+        is_blocked(id),
+        "the sleeper is not blocked, so this test is measuring nothing"
+    );
+
+    unblock(id);
+
+    // Only reached after the sleeper has recorded a 3. Waking something that
+    // outranks us takes the CPU away inside `unblock`, so the ordering of
+    // these last two entries is the assertion about immediacy.
+    note_run(4);
+}
+
+static SLEEPER: Lock<Option<TaskId>> = Lock::new(None);
+
+/// A task that goes to sleep and stays there until somebody else wakes it.
+extern "C" fn napper(_arg: u64) {
+    block_current();
+}
+
+/// Prove the scheduler picks by priority, round robins only within a
+/// priority, and never picks a blocked task.
+pub fn priority_self_test() {
+    // Part one: strict priority order.
+    //
+    // The low priority pair is spawned first on purpose. Under the round robin
+    // scheduler this replaces, they occupy the earlier slots and would be
+    // picked first, so a stale scheduler fails on the very first entry rather
+    // than somewhere subtle.
+    //
+    // Created with interrupts masked, because the group has to become
+    // schedulable all at once. Spawning is a scheduling event now: the moment
+    // "low-a" exists it outranks the idle task, so a tick landing between two
+    // of these calls would run a low priority worker before its high priority
+    // rival had been created, and the recorded order would be wrong for a
+    // reason that has nothing to do with the scheduler.
+    reset_order();
+    sync::without_interrupts(|| {
+        spawn_at("low-a", ladder_worker, 10, Priority::LOW);
+        spawn_at("low-b", ladder_worker, 11, Priority::LOW);
+        spawn_at("high-a", ladder_worker, 20, Priority::HIGH);
+        spawn_at("high-b", ladder_worker, 21, Priority::HIGH);
+    });
+
+    // Task 0 sits at the idle priority, so this loop does not get the CPU back
+    // until all four have finished. The waiting is free.
+    while runnable_others() > 0 {
+        yield_now();
+    }
+
+    let order = ORDER.lock();
+    let expected = [20u8, 21, 20, 21, 20, 21, 10, 11, 10, 11, 10, 11];
+    assert_eq!(order.len, expected.len(), "wrong number of turns taken");
+    assert_eq!(
+        order.tags[..expected.len()],
+        expected,
+        "tasks did not run in priority order with round robin inside each level"
+    );
+    drop(order);
+
+    // Part two: blocked is not a candidate, and waking is immediate.
+    reset_order();
+    sync::without_interrupts(|| {
+        let sleeping = spawn_at("sleeper", sleeper, 0, Priority::HIGH);
+        *SLEEPER.lock() = Some(sleeping);
+        spawn_at("waker", waker, 0, Priority::NORMAL);
+    });
+
+    while runnable_others() > 0 {
+        yield_now();
+    }
+
+    let order = ORDER.lock();
+    // 1: the sleeper ran and blocked.
+    // 2: a lower priority task ran while the highest priority task in the
+    //    table was sitting there blocked.
+    // 3: the sleeper resumed the instant it was woken, not at the next tick.
+    // 4: only then did the waker get the rest of its turn.
+    assert_eq!(
+        order.tags[..order.len],
+        [1u8, 2, 3, 4],
+        "a blocked task was scheduled, or waking one did not preempt the waker"
+    );
+    drop(order);
+
+    // Part three: the machine still runs when every real task is asleep.
+    //
+    // A scheduler that picks blocked tasks, or that has no answer when nothing
+    // is runnable, dies here rather than in six months inside the IPC code.
+    let napping = spawn_at("napper", napper, 0, Priority::HIGH);
+    while !is_blocked(napping) {
+        yield_now();
+    }
+
+    let ticks_before = crate::timer::ticks();
+    let mut spins = 0u32;
+    while crate::timer::ticks() == ticks_before && spins < 10_000_000 {
+        spins += 1;
+        core::hint::black_box(spins);
+    }
+    let idle_ticks = crate::timer::ticks() - ticks_before;
+    assert!(
+        idle_ticks > 0,
+        "the timer stopped while the only runnable task was idle"
+    );
+
+    unblock(napping);
+    while !finished(napping) {
+        yield_now();
+    }
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+    release_dead();
+
+    print!("priority self test: passed, ");
+    println!(
+        "high ran to completion before low, blocked task skipped while highest priority, \
+         idle survived {idle_ticks} ticks with everything asleep"
+    );
 }
 
 // --- EL0 ---
@@ -796,11 +1142,16 @@ pub fn exit_code(id: TaskId) -> Option<u64> {
     SCHEDULER.lock().tasks[id.0].as_ref()?.exit_code
 }
 
-/// Has this task stopped running, whether or not it has been cleaned up yet?
+/// Has this task stopped for good, whether or not it has been cleaned up yet?
+///
+/// Spelled out rather than written as "not runnable". Blocked is also not
+/// runnable, and a blocked task is the opposite of finished: it is waiting to
+/// carry on. Reading this as `!= Runnable` would report a task as done the
+/// moment it went to sleep.
 fn finished(id: TaskId) -> bool {
     matches!(
         SCHEDULER.lock().tasks[id.0].as_ref(),
-        Some(task) if task.state != State::Runnable
+        Some(task) if matches!(task.state, State::Zombie | State::Dead | State::Faulted)
     )
 }
 
@@ -1085,7 +1436,13 @@ fn spawn_user_program(name: &'static str, start: u64, end: u64) -> TaskId {
         paging::Attributes::user_data(),
     );
 
-    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space))
+    spawn_in(
+        name,
+        user_task_entry,
+        USER_TEXT_VA,
+        Some(space),
+        Priority::NORMAL,
+    )
 }
 
 /// Check that an unprivileged task can kill itself without killing anything
