@@ -16,6 +16,7 @@
 //! hardware would have enforced had the access come from EL0.
 
 use crate::exceptions::TrapFrame;
+use crate::ipc;
 use crate::paging;
 use crate::tasks;
 use crate::uart;
@@ -24,6 +25,9 @@ pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_YIELD: u64 = 2;
 pub const SYS_GETPID: u64 = 3;
+pub const SYS_SEND: u64 = 4;
+pub const SYS_RECV: u64 = 5;
+pub const SYS_REPLY: u64 = 6;
 
 /// Returned for anything we do not recognise or will not do.
 ///
@@ -42,17 +46,31 @@ const MAX_WRITE: u64 = 4096;
 /// instruction follows every syscall.
 pub fn dispatch(frame: &mut TrapFrame) {
     let number = frame.x[8];
-    let args = [frame.x[0], frame.x[1], frame.x[2]];
+    let a = [
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+    ];
 
-    let result = match number {
-        SYS_EXIT => sys_exit(args[0]),
-        SYS_WRITE => sys_write(args[0], args[1], args[2]),
-        SYS_YIELD => sys_yield(),
-        SYS_GETPID => sys_getpid(),
-        _ => EINVAL,
+    // The message calls return two or three values, so results come back as a
+    // triple and the unused words are zeros. Writing every one of x0..x2 on
+    // every syscall keeps a caller from reading a stale register and believing
+    // it, which is a bug that only shows up in the calls that return less.
+    let (r0, r1, r2) = match number {
+        SYS_EXIT => (sys_exit(a[0]), 0, 0),
+        SYS_WRITE => (sys_write(a[0], a[1], a[2]), 0, 0),
+        SYS_YIELD => (sys_yield(), 0, 0),
+        SYS_GETPID => (sys_getpid(), 0, 0),
+        SYS_SEND => {
+            let (rc, len) = ipc::send(a[0], a[1], a[2], a[3], a[4], a[5]);
+            (rc, len, 0)
+        }
+        SYS_RECV => ipc::recv(a[0], a[1]),
+        SYS_REPLY => (ipc::reply(a[0], a[1], a[2], a[3]), 0, 0),
+        _ => (EINVAL, 0, 0),
     };
 
-    frame.x[0] = result;
+    frame.x[0] = r0;
+    frame.x[1] = r1;
+    frame.x[2] = r2;
 }
 
 fn sys_exit(code: u64) -> u64 {

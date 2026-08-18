@@ -8,6 +8,7 @@
 pub mod exceptions;
 pub mod frames;
 pub mod gic;
+pub mod ipc;
 pub mod paging;
 pub mod semihosting;
 pub mod sync;
@@ -133,10 +134,12 @@ extern "C" fn kernel_main_high() -> ! {
     tasks::lifecycle_self_test();
     tasks::fault_self_test();
     tasks::priority_self_test();
+    tasks::ipc_self_test();
     println!("tier 2: preemptive scheduling online.");
     println!("tier 2: EL0 and syscalls online.");
     println!("tier 3: task faults are contained.");
     println!("tier 3: priority scheduling and blocking online.");
+    println!("tier 3: synchronous IPC online.");
     println!();
 
     halt()

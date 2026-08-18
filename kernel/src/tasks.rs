@@ -51,7 +51,7 @@ const STACK_CANARY: u64 = 0x5441_434b_5f43_414e; // "TACK_CAN"
 /// This is a limit on tasks alive at once, not on tasks ever created. The self
 /// tests run eleven tasks through these eight slots, which is itself a check
 /// that slots really do come back.
-const MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = 8;
 
 /// Offsets within the 96 byte frame `switch.S` pushes, in u64 units.
 ///
@@ -394,20 +394,53 @@ pub fn yield_now() {
 pub fn block_current() {
     let state = sync::disable_interrupts();
 
-    {
-        let mut scheduler = SCHEDULER.lock();
-        let current = scheduler.current;
-        if let Some(task) = scheduler.tasks[current].as_mut() {
-            task.state = State::Blocked;
-        }
-    }
-
-    switch_to_next(Reason::Voluntary);
+    mark_current_blocked();
+    park();
 
     // By the time we are back, whoever woke us has already put the state back
     // to Runnable. Doing it here instead would leave a window where a resumed
     // task is still marked blocked.
     sync::restore_interrupts(state);
+}
+
+/// Take the current task out of the running, but keep the CPU for now.
+///
+/// The first half of `block_current`, split out because a task that is about
+/// to wake somebody else has to be out of the run queue *before* it does the
+/// waking. Otherwise the woken task can answer immediately, and its answer
+/// arrives as a wakeup for a task that still looks runnable, which does
+/// nothing. The would-be sleeper then blocks with its answer already delivered
+/// and never wakes up again.
+///
+/// Marking is not stopping. This task keeps running until it calls `park`.
+pub fn mark_current_blocked() {
+    let mut scheduler = SCHEDULER.lock();
+    let current = scheduler.current;
+    if let Some(task) = scheduler.tasks[current].as_mut() {
+        task.state = State::Blocked;
+    }
+}
+
+/// Actually stop, if there is still anything to wait for.
+///
+/// The second half. Conditional on purpose: between marking and parking, the
+/// thing being waited for may already have happened and put this task back to
+/// `Runnable`. Parking anyway would be a sleep with nobody left holding a
+/// reason to wake it, which is the lost wakeup this pair exists to prevent.
+///
+/// Interrupts must already be masked, and the caller must already have
+/// arranged for something to wake it.
+pub fn park() {
+    let blocked = {
+        let scheduler = SCHEDULER.lock();
+        scheduler.tasks[scheduler.current]
+            .as_ref()
+            .is_some_and(|task| task.state == State::Blocked)
+    };
+
+    if blocked {
+        switch_to_next(Reason::Voluntary);
+    }
 }
 
 /// Put a blocked task back in the running.
@@ -444,6 +477,39 @@ pub fn unblock(id: TaskId) {
     }
 
     sync::restore_interrupts(state);
+}
+
+/// Can this task still be sent to?
+///
+/// False for every terminal state, so a task that has exited, been reaped, or
+/// faulted is not something anybody can rendezvous with. Callers use this to
+/// turn "wait for a reply that will never come" into an error return.
+pub fn is_alive(id: TaskId) -> bool {
+    matches!(
+        SCHEDULER.lock().tasks.get(id.0).and_then(Option::as_ref),
+        Some(task) if matches!(task.state, State::Runnable | State::Blocked)
+    )
+}
+
+/// This task's scheduling priority, if the slot is occupied.
+pub fn priority_of(id: TaskId) -> Option<Priority> {
+    Some(SCHEDULER.lock().tasks.get(id.0)?.as_ref()?.priority)
+}
+
+/// Root of any task's address space, not just the running one.
+///
+/// The kernel needs this to touch a blocked task's memory on its behalf, which
+/// is the whole basis of message passing: the sender is not running when its
+/// buffer is read.
+pub fn space_root_of(id: TaskId) -> Option<Frame> {
+    SCHEDULER
+        .lock()
+        .tasks
+        .get(id.0)?
+        .as_ref()?
+        .space
+        .as_ref()
+        .map(AddressSpace::root)
 }
 
 /// Is this task waiting on something?
@@ -572,13 +638,16 @@ pub fn current_id() -> TaskId {
 /// Called from `task_trampoline`, never from Rust.
 #[unsafe(no_mangle)]
 pub extern "C" fn task_finished() -> ! {
-    {
+    let id = {
         let mut scheduler = SCHEDULER.lock();
         let current = scheduler.current;
         if let Some(task) = scheduler.tasks[current].as_mut() {
             task.state = State::Zombie;
         }
-    }
+        current
+    };
+
+    crate::ipc::abandon(TaskId(id));
 
     // The stack under our feet belongs to this task, so it cannot be reclaimed
     // from here. Freeing it is #20's problem, and doing it now would mean
@@ -860,6 +929,115 @@ pub fn isolation_self_test() {
     println!("{ISOLATION_WORKERS} tasks each read their own value back from {ISOLATION_VA:#x}");
 }
 
+// --- IPC ---
+
+/// Spawn the message server at EL0.
+pub fn spawn_ipc_server(name: &'static str, priority: Priority) -> TaskId {
+    spawn_user_program(
+        name,
+        (&raw const user_server_start) as u64,
+        (&raw const user_server_end) as u64,
+        0,
+        priority,
+    )
+}
+
+/// Spawn the message client, told which task to talk to.
+pub fn spawn_ipc_client(name: &'static str, server: TaskId, priority: Priority) -> TaskId {
+    spawn_user_program(
+        name,
+        (&raw const user_client_start) as u64,
+        (&raw const user_client_end) as u64,
+        server.0 as u64,
+        priority,
+    )
+}
+
+/// What the client exits with when a check fails, for a message that names the
+/// check rather than the number.
+fn client_failure(code: u64) -> &'static str {
+    match code {
+        1 => "the server reported the message arrived wrong",
+        2 => "the reply was the wrong length",
+        3 => "the reply bytes did not survive the copy",
+        4 => "sending to a dead task did not return EDEAD",
+        _ => "unknown failure",
+    }
+}
+
+/// Run one client and server exchange and check both ends agree it worked.
+///
+/// `server_priority` decides which of the two rendezvous paths gets used. A
+/// server that outranks its client reaches `recv` first and is already waiting
+/// when the message arrives; a client that outranks its server sends into an
+/// empty room and waits to be collected. Both have to work, and they are
+/// different code, so the test runs it twice rather than picking one.
+fn ipc_round(server_priority: Priority, client_priority: Priority) {
+    let (server, client) = sync::without_interrupts(|| {
+        let server = spawn_ipc_server("server", server_priority);
+        let client = spawn_ipc_client("client", server, client_priority);
+        (server, client)
+    });
+
+    // Bounded. A rendezvous that goes wrong goes wrong by waiting forever, and
+    // an unbounded wait here would surface as the boot test timing out with
+    // nothing to say. One second is several orders of magnitude more than the
+    // exchange needs and still fails long before the test harness gives up.
+    let deadline = crate::timer::ticks() + 100;
+    while !finished(client) || !finished(server) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the exchange never finished; somebody is waiting for something that is not coming"
+        );
+        yield_now();
+    }
+
+    let server_code = exit_code(server).expect("server finished without an exit code");
+    let client_code = exit_code(client).expect("client finished without an exit code");
+
+    // Collected first, then cleaned up. The wait loop above can exit with the
+    // last task still a zombie: it becomes one and yields, and the next switch
+    // is the one that reaps it, which is a switch this loop no longer makes.
+    reap_zombies();
+    release_dead();
+
+    assert_eq!(
+        server_code, 0,
+        "the server did not receive what the client sent"
+    );
+    assert_eq!(
+        client_code,
+        0,
+        "client check failed: {}",
+        client_failure(client_code)
+    );
+}
+
+/// Two tasks that cannot see each other's memory exchange a message.
+pub fn ipc_self_test() {
+    reap_zombies();
+    release_dead();
+    let before_frames = frames::free_frames();
+
+    // Receiver already waiting when the message arrives.
+    ipc_round(Priority::HIGH, Priority::NORMAL);
+    // Message queued until somebody comes to collect it.
+    ipc_round(Priority::NORMAL, Priority::HIGH);
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+    assert_eq!(
+        frames::free_frames(),
+        before_frames,
+        "an exchange leaked memory"
+    );
+
+    print!("ipc self test: passed, ");
+    println!(
+        "message and reply survived both directions across two address spaces, \
+         both rendezvous orders, dead target refused"
+    );
+}
+
 // --- priorities and blocking ---
 
 /// Who ran, in the order they ran. The assertion for this tier is about
@@ -1050,11 +1228,27 @@ const USER_TEXT_VA: u64 = 0x0040_0000;
 /// Top of the user stack. Grows down into the page below.
 const USER_STACK_TOP: u64 = 0x0080_0000;
 
+/// The startup argument sits in the top word of the stack page, and `SP_EL0`
+/// starts below it, so a program reads it with `ldr x0, [sp, #8]`.
+///
+/// On the stack rather than in a register because there is nowhere else to put
+/// it: `user_task_entry` is an ordinary task entry and gets one `u64`, which
+/// the entry point already uses. Handing a new program its arguments on the
+/// stack is also what every real loader does, so this is the conventional
+/// shape rather than an expedient one. Sixteen bytes, not eight, to keep
+/// `SP_EL0` 16 byte aligned as the ABI requires.
+const USER_ARG_OFFSET: u64 = 8;
+const USER_SP_START: u64 = USER_STACK_TOP - 16;
+
 unsafe extern "C" {
     static user_program_start: u8;
     static user_program_end: u8;
     static user_fault_start: u8;
     static user_fault_end: u8;
+    static user_client_start: u8;
+    static user_client_end: u8;
+    static user_server_start: u8;
+    static user_server_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.
@@ -1087,7 +1281,7 @@ unsafe fn enter_el0(entry: u64, stack: u64) -> ! {
 /// which is what `SP_EL1` points at when a syscall or an interrupt brings it
 /// back up to EL1.
 extern "C" fn user_task_entry(entry: u64) {
-    unsafe { enter_el0(entry, USER_STACK_TOP) }
+    unsafe { enter_el0(entry, USER_SP_START) }
 }
 
 /// Create a task that runs the well behaved user program at EL0.
@@ -1096,6 +1290,8 @@ pub fn spawn_user(name: &'static str) -> TaskId {
         name,
         (&raw const user_program_start) as u64,
         (&raw const user_program_end) as u64,
+        0,
+        Priority::NORMAL,
     )
 }
 
@@ -1105,6 +1301,8 @@ pub fn spawn_faulting_user(name: &'static str) -> TaskId {
         name,
         (&raw const user_fault_start) as u64,
         (&raw const user_fault_end) as u64,
+        0,
+        Priority::NORMAL,
     )
 }
 
@@ -1123,14 +1321,20 @@ pub fn current_space_root() -> Option<Frame> {
 /// Never returns. The kernel stack under our feet belongs to this task, so it
 /// cannot be reclaimed from here; that is #20's problem.
 pub fn exit_current(code: u64) -> ! {
-    {
+    let id = {
         let mut scheduler = SCHEDULER.lock();
         let current = scheduler.current;
         if let Some(task) = scheduler.tasks[current].as_mut() {
             task.state = State::Zombie;
             task.exit_code = Some(code);
         }
-    }
+        current
+    };
+
+    // Anybody waiting on a message from us is waiting on something that will
+    // never arrive. Checking liveness when the message was sent is not enough
+    // on its own, because a target is free to exit afterwards.
+    crate::ipc::abandon(TaskId(id));
 
     loop {
         yield_now();
@@ -1352,6 +1556,8 @@ pub fn fault_current(fault: Fault) -> ! {
         (current, task.name)
     };
 
+    crate::ipc::abandon(TaskId(id));
+
     let syndrome = fault.syndrome();
     println!();
     println!("--- task fault ---");
@@ -1404,7 +1610,13 @@ pub fn kill(id: TaskId) {
 }
 
 /// Copy a user program blob into a fresh address space and spawn it at EL0.
-fn spawn_user_program(name: &'static str, start: u64, end: u64) -> TaskId {
+fn spawn_user_program(
+    name: &'static str,
+    start: u64,
+    end: u64,
+    arg: u64,
+    priority: Priority,
+) -> TaskId {
     let space = AddressSpace::new();
 
     let len = (end - start) as usize;
@@ -1436,13 +1648,15 @@ fn spawn_user_program(name: &'static str, start: u64, end: u64) -> TaskId {
         paging::Attributes::user_data(),
     );
 
-    spawn_in(
-        name,
-        user_task_entry,
-        USER_TEXT_VA,
-        Some(space),
-        Priority::NORMAL,
-    )
+    // Planted through the kernel's own view of the frame, because the task's
+    // address space is not the one currently in TTBR0 and will not be until it
+    // is scheduled.
+    let stack_top_alias = paging::phys_to_virt(stack.addr()) + FRAME_SIZE;
+    unsafe {
+        core::ptr::write_volatile((stack_top_alias - USER_ARG_OFFSET) as *mut u64, arg);
+    }
+
+    spawn_in(name, user_task_entry, USER_TEXT_VA, Some(space), priority)
 }
 
 /// Check that an unprivileged task can kill itself without killing anything

@@ -738,13 +738,31 @@ pub fn lookup(root: Frame, va: u64) -> Option<u64> {
 /// task's own tables asks the hardware's question rather than a convenient
 /// approximation of it.
 pub fn user_readable(root: Frame, va: u64, len: u64) -> bool {
+    // AP is two bits: the low one says writable, the high one says EL0 may
+    // touch it at all. 0b01 and 0b11 are the EL0-accessible encodings.
+    user_range(root, va, len, |ap| ap == AP_RW_ALL || ap == AP_RO_ALL)
+}
+
+/// Could EL0 write every byte of `va..va + len` through `root`?
+///
+/// The read check's sibling, and needed for the same reason: a syscall that
+/// fills in a buffer on a task's behalf is about to write through a pointer
+/// the task chose. `AP_RW_ALL` is the only encoding that lets EL0 write, so
+/// the read-only user encoding is refused here even though it passes the read
+/// check.
+pub fn user_writable(root: Frame, va: u64, len: u64) -> bool {
+    user_range(root, va, len, |ap| ap == AP_RW_ALL)
+}
+
+/// Shared walk behind the two permission checks.
+fn user_range(root: Frame, va: u64, len: u64, allowed: impl Fn(u64) -> bool) -> bool {
     if len == 0 {
         return true;
     }
 
-    // Reject the whole low half boundary case before doing arithmetic that
-    // could wrap. A length chosen to overflow the addition is exactly the sort
-    // of argument this function exists to refuse.
+    // Reject the low half boundary case before doing arithmetic that could
+    // wrap. A length chosen to overflow the addition is exactly the sort of
+    // argument this function exists to refuse.
     let Some(end) = va.checked_add(len) else {
         return false;
     };
@@ -757,15 +775,91 @@ pub fn user_readable(root: Frame, va: u64, len: u64) -> bool {
         let Some(entry) = lookup(root, page) else {
             return false;
         };
-
-        // AP is two bits: the low one says writable, the high one says EL0 may
-        // touch it at all. 0b01 and 0b11 are the EL0-accessible encodings.
-        let ap = (entry >> AP_SHIFT) & 0b11;
-        if ap != AP_RW_ALL && ap != AP_RO_ALL {
+        if !allowed((entry >> AP_SHIFT) & 0b11) {
             return false;
         }
-
         page += PAGE_SIZE;
+    }
+
+    true
+}
+
+/// Virtual to physical through `root`, or `None` if nothing is mapped.
+///
+/// Tracks the level it stopped at rather than reusing `lookup`, because a
+/// block descriptor's address field is aligned to the block rather than to a
+/// page: taking the low bits from the wrong granule lands somewhere plausible
+/// and wrong, which is the worst kind of wrong.
+pub fn translate(root: Frame, va: u64) -> Option<u64> {
+    let mut table = root;
+
+    for level in 0..3 {
+        let entry = read_entry(table, table_index(va, level));
+        if entry & VALID == 0 {
+            return None;
+        }
+        if entry & TABLE_OR_PAGE == 0 {
+            // Only levels 1 and 2 may hold blocks with a 4 KiB granule, at
+            // 1 GiB and 2 MiB respectively.
+            let size = match level {
+                1 => 512 * BLOCK_2MIB,
+                2 => BLOCK_2MIB,
+                _ => return None,
+            };
+            return Some((entry & ADDR_MASK & !(size - 1)) | (va & (size - 1)));
+        }
+        table = Frame::from_addr(entry & ADDR_MASK);
+    }
+
+    let entry = read_entry(table, table_index(va, 3));
+    (entry & VALID != 0).then_some((entry & ADDR_MASK) | (va & (PAGE_SIZE - 1)))
+}
+
+/// Copy `len` bytes from one address space into another.
+///
+/// The kernel is the only thing that can do this, and it is why message
+/// passing has to go through a syscall at all: neither task can see the
+/// other's memory, and only one low half is in `TTBR0_EL1` at a time.
+///
+/// It copies through the high half physical map rather than swapping
+/// `TTBR0_EL1` twice per chunk. Swapping would mean a TLB invalidate on each
+/// side of every chunk, and a window where the running task's own address
+/// space is not loaded, which is a hazard to reason about for no gain. The
+/// high half already maps all of physical memory, so both sides are reachable
+/// at once.
+///
+/// Walks both spaces per chunk, so the two sides do not need matching page
+/// offsets or matching alignment. Returns false if any page on either side is
+/// unmapped, which the caller should have ruled out already; checking anyway
+/// costs a comparison and turns a kernel-side wild write into a refusal.
+pub fn copy_across(src_root: Frame, src_va: u64, dst_root: Frame, dst_va: u64, len: u64) -> bool {
+    let mut done = 0;
+
+    while done < len {
+        let src = src_va + done;
+        let dst = dst_va + done;
+
+        let (Some(src_pa), Some(dst_pa)) = (translate(src_root, src), translate(dst_root, dst))
+        else {
+            return false;
+        };
+
+        // Stop at whichever page boundary comes first. The two buffers can sit
+        // at different offsets within their pages, so neither side's boundary
+        // can be assumed to be the limit.
+        let src_left = PAGE_SIZE - (src & (PAGE_SIZE - 1));
+        let dst_left = PAGE_SIZE - (dst & (PAGE_SIZE - 1));
+        let chunk = (len - done).min(src_left).min(dst_left);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(src_pa) as *const u8,
+                phys_to_virt(dst_pa) as *mut u8,
+                chunk as usize,
+            );
+        }
+
+        done += chunk;
     }
 
     true

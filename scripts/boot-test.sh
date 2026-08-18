@@ -68,6 +68,13 @@ EXPECTED=(
     "high ran to completion before low"
     "blocked task skipped while highest priority"
     "tier 3: priority scheduling and blocking online"
+    # Printed by the server task, at EL0, from bytes the client wrote in a
+    # different address space. Nothing in the kernel prints "ping", and neither
+    # task can read the other's memory, so this line is the copy happening.
+    "ipc: server received ping"
+    "ipc self test: passed"
+    "message and reply survived both directions"
+    "tier 3: synchronous IPC online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
