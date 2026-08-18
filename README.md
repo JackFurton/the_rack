@@ -83,6 +83,7 @@ ipc self test: passed, message and reply survived both directions across two add
 lease self test: passed, buffer lent and written across address spaces
 supervisor self test: passed, task faulted, supervisor restarted it with clean memory
 notification self test: passed, unwanted bit did not wake the task and was kept
+forged reply self test: passed, a task that did not receive the message could not answer it
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
@@ -432,6 +433,31 @@ by the kernel at startup. A task that could claim a line could take another
 task's device or silence it, and there is no way to tell a legitimate claim from
 a theft without something that already knows the intended shape of the system.
 The supervisor is where that will go.
+
+**Why only the receiver may answer a message.** `reply` checks both that the
+sender is waiting for a reply and that it is waiting on *the caller*. Without
+the second half any task could release somebody else's sender and hand it a
+fabricated answer, which the sender has no way to tell from a real one.
+
+The check went in with the IPC and stayed untested for two tiers, because
+proving it needs a moment when a reply is outstanding and the task entitled to
+give it is not running, and a two task exchange never has one: the receiver
+answers immediately. Notifications made the window: a server that parks waiting
+for its device leaves a message in its hands and the CPU to somebody else, which
+is both the realistic case and the one worth defending.
+
+**Why a lock guard must not live in a `match` scrutinee.** `Lock` is interrupt
+masking, so its guard restores the interrupt state it captured when it drops. A
+guard created in a scrutinee lives until the end of the whole `match`, which
+means an arm that restores the interrupt state itself and returns has the guard
+drop *after* it and restore the state again, to whatever was current when the
+lock was taken. That is "masked", and the mask never comes off. The machine
+keeps running, the timer never fires again, and nothing anywhere says why.
+
+This was sitting in `reply`'s refusal path from the day it was written. Nothing
+had ever taken that path, because refusing a reply needs a task that did not
+receive the message to try to answer it, which is exactly the case that had no
+test. Writing the test found the check worked and the code around it did not.
 
 ## Layout
 

@@ -1365,6 +1365,98 @@ pub fn notification_self_test() {
     );
 }
 
+/// Only the task a message was sent to may answer it.
+///
+/// The exchange in `ipc_self_test` cannot check this, because two tasks leave
+/// nobody spare to forge anything. What it needs is a moment when a reply is
+/// outstanding and the task entitled to give it is not running, and that moment
+/// does not exist unless the server is made to wait for something.
+pub fn forged_reply_self_test() {
+    reap_zombies();
+    release_dead();
+    let before_frames = frames::free_frames();
+
+    let (server, client) = sync::without_interrupts(|| {
+        let server = spawn_user_program(
+            "slowsrv",
+            (&raw const user_slow_server_start) as u64,
+            (&raw const user_slow_server_end) as u64,
+            0,
+            Priority::HIGH,
+        );
+        let client = spawn_ipc_client("client", server, Priority::NORMAL);
+        (server, client)
+    });
+
+    // Wait for the window to open: the client owed a reply, the server parked
+    // on a notification. Task 0 runs here precisely because nothing else can.
+    let deadline = crate::timer::ticks() + 100;
+    while !(crate::ipc::is_awaiting_reply(client) && is_blocked(server)) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the exchange never reached the point where a reply is outstanding"
+        );
+        yield_now();
+    }
+
+    // The forgery. Task 0 never received this message and must not be able to
+    // answer it: doing so would release somebody else's sender and hand it a
+    // reply it has no way to tell from a real one.
+    //
+    // Zero length on purpose. It gets no further than the guard even if the
+    // caller had memory to copy from, which task 0 does not, so a pass here is
+    // the guard and not an accident of having nothing to send.
+    const FORGED: u64 = 0xbad;
+    let refused = crate::ipc::reply(client.0 as u64, FORGED, 0, 0);
+    assert_eq!(
+        refused,
+        crate::ipc::EINVAL,
+        "a task that never received the message was allowed to answer it"
+    );
+    assert!(
+        crate::ipc::is_awaiting_reply(client),
+        "the forged reply was reported as refused but released the sender anyway"
+    );
+
+    // Let the real receiver get on with it.
+    crate::notify::post(server, 1);
+
+    let deadline = crate::timer::ticks() + 100;
+    while !finished(client) || !finished(server) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the exchange never finished after the server was released"
+        );
+        yield_now();
+    }
+
+    let client_code = exit_code(client).expect("client finished without an exit code");
+    reap_zombies();
+    release_dead();
+
+    // The client checks the reply it got byte for byte, so this is also the
+    // assertion that the forged answer did not reach it: 0xbad carries no body
+    // at all, and the client would have failed on the length.
+    assert_eq!(
+        client_code,
+        0,
+        "client check failed: {}",
+        client_failure(client_code)
+    );
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+    assert_eq!(
+        frames::free_frames(),
+        before_frames,
+        "the exchange leaked memory"
+    );
+
+    print!("forged reply self test: passed, ");
+    println!(
+        "a task that did not receive the message could not answer it, and the real reply still arrived"
+    );
+}
+
 // --- priorities and blocking ---
 
 /// Who ran, in the order they ran. The assertion for this tier is about
@@ -1590,6 +1682,8 @@ unsafe extern "C" {
     static user_heartbeat_end: u8;
     static user_notified_start: u8;
     static user_notified_end: u8;
+    static user_slow_server_start: u8;
+    static user_slow_server_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.
