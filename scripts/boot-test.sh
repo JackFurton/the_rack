@@ -108,6 +108,12 @@ EXPECTED=(
     "notification self test: passed"
     "unwanted bit did not wake the task and was kept"
     "tier 3: notifications online, heartbeat now runs at EL0"
+    # A reply outstanding, and the one task entitled to give it parked. The
+    # window only exists because the server waits on a notification, which is
+    # why this check had to wait for notifications to exist.
+    "ipc: slow server received ping"
+    "forged reply self test: passed"
+    "could not answer it, and the real reply still arrived"
 )
 
 # The run is not finished until the machine has proved it keeps running on its

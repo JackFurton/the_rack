@@ -139,6 +139,7 @@ extern "C" fn kernel_main_high() -> ! {
     tasks::lease_self_test();
     tasks::supervisor_self_test();
     tasks::notification_self_test();
+    tasks::forged_reply_self_test();
     println!("tier 2: preemptive scheduling online.");
     println!("tier 2: EL0 and syscalls online.");
     println!("tier 3: task faults are contained.");

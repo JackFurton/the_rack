@@ -943,3 +943,79 @@ user_notified_start:
 
     .balign 4
 user_notified_end:
+
+// A server that takes its time.
+//
+// Identical to the ordinary one except that it parks on a notification between
+// receiving and replying, which is what a real server does while it waits for
+// the device it is fronting. The gap is the interesting part: for as long as it
+// lasts there is a task waiting for a reply and the one task entitled to give
+// it one is not running.
+
+    .section .text.user, "ax"
+    .global user_slow_server_start
+    .global user_slow_server_end
+
+user_slow_server_start:
+    sub     sp, sp, #64
+    mov     x20, sp
+
+    mov     x8, #SYS_RECV
+    mov     x0, x20
+    mov     x1, #32
+    mov     x2, xzr
+    svc     #0
+    mov     x19, x0
+    mov     x22, x2
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    adr     x1, .Lslow_got
+    mov     x2, #(.Lslow_got_end - .Lslow_got)
+    svc     #0
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    mov     x1, x20
+    mov     x2, x22
+    svc     #0
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    adr     x1, .Lslow_newline
+    mov     x2, #1
+    svc     #0
+
+    // Wait to be released. Nothing else in the system can answer the message
+    // sitting in our hands, and that is the property being checked while we
+    // are here.
+    mov     x8, #SYS_RECV
+    mov     x0, xzr
+    mov     x1, xzr
+    mov     x2, #1
+    svc     #0
+
+    mov     x8, #SYS_REPLY
+    mov     x0, x19
+    mov     x1, xzr
+    adr     x2, .Lslow_answer
+    mov     x3, #(.Lslow_answer_end - .Lslow_answer)
+    svc     #0
+
+    mov     x8, #SYS_EXIT
+    mov     x0, xzr
+    svc     #0
+.Lslow_stuck:
+    b       .Lslow_stuck
+
+.Lslow_got:
+    .ascii  "ipc: slow server received "
+.Lslow_got_end:
+.Lslow_newline:
+    .ascii  "\n"
+.Lslow_answer:
+    .ascii  "pong!"
+.Lslow_answer_end:
+
+    .balign 4
+user_slow_server_end:

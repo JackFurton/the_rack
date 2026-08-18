@@ -520,10 +520,20 @@ pub fn reply(sender: u64, rc: u64, data: u64, data_len: u64) -> u64 {
 
     let state = sync::disable_interrupts();
 
+    // Read out into a local first, so the lock guard is gone before the match.
+    //
+    // Not a style preference. A guard created in a match scrutinee lives until
+    // the end of the whole match, so an arm that restores the interrupt state
+    // and returns would then have the guard drop *after* it and restore the
+    // state again, to whatever was current when the lock was taken. That is
+    // "masked", and the mask never comes back off. The machine keeps running,
+    // the timer never fires again, and nothing says why.
+    let pending = TABLE.lock().pending[sender_id.0];
+
     // Only the task that received the message may answer it, and only while
     // the sender is actually waiting. Without the first check any task could
     // release somebody else's sender and feed it a fabricated reply.
-    let message = match TABLE.lock().pending[sender_id.0] {
+    let message = match pending {
         Some(Pending::ReplyWait(message)) if message.target == me.0 => message,
         _ => {
             sync::restore_interrupts(state);
@@ -736,6 +746,18 @@ fn borrow(peer: u64, index: u64, offset: u64, local: u64, len: u64, writing: boo
     };
 
     finish(if ok { 0 } else { EFAULT })
+}
+
+/// Is this task blocked waiting for somebody to answer a message it sent?
+///
+/// Exists so a test can find the moment a reply is outstanding, which is a
+/// window that closes as soon as the real receiver runs and is not otherwise
+/// observable from outside.
+pub fn is_awaiting_reply(id: TaskId) -> bool {
+    matches!(
+        TABLE.lock().pending.get(id.0),
+        Some(Some(Pending::ReplyWait(_)))
+    )
 }
 
 /// Copy out of a region somebody lent us.
