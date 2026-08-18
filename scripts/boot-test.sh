@@ -62,6 +62,12 @@ EXPECTED=(
     "the kernel is fine. this task is not."
     "fault self test: passed"
     "tier 3: task faults are contained"
+    # Order, not participation. A round robin scheduler also lets everybody
+    # run, so "they all ran" would pass on the thing this replaces.
+    "priority self test: passed"
+    "high ran to completion before low"
+    "blocked task skipped while highest priority"
+    "tier 3: priority scheduling and blocking online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks

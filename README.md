@@ -77,9 +77,11 @@ lifecycle self test: passed, task took 11 frames and gave back all 11
   the kernel is fine. this task is not.
 ------------------
 fault self test: passed, task died on translation fault, kernel survived
+priority self test: passed, high ran to completion before low, blocked task skipped
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
+tier 3: priority scheduling and blocking online.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -250,6 +252,47 @@ test we can run today and then hangs on real silicon. On one core with no
 preemption, masking interrupts is not an approximation of mutual exclusion, it
 is exactly mutual exclusion, and it works with the MMU off. This grows a real
 spinlock underneath the same API when tier 6 boots a second core.
+
+**Why lower priority numbers win.** `Priority(0)` outranks `Priority(1)`, which
+reads backwards until you notice that everything else in the neighbourhood
+agrees: Hubris, the GIC's priority registers, and Unix nice values all treat a
+smaller number as more urgent. Flipping it to be friendlier would mean every
+comparison against a hardware priority register read the opposite way round
+from the one next to it. A named `outranks` method carries the meaning instead,
+because `a < b` meaning "a is more important" is exactly the line that gets
+read wrong.
+
+**Why scheduling is strictly priority ordered, not fair.** A runnable task at
+priority 0 runs and a task at priority 1 does not, however long it has waited.
+Round robin applies only within one priority. This is the Hubris model, and the
+reason is latency: "the high priority task runs as soon as it is runnable" is a
+sentence you can build a real-time guarantee on, and no amount of time slicing
+between priorities produces it. The cost is that starvation is a designed
+outcome rather than a bug, and the answer to a starved task is to not give a
+busy task a high priority.
+
+**Why the kernel thread is the idle task.** Task 0 sits at `Priority::IDLE` and
+is always runnable, so it gets the CPU exactly when nothing else can use it.
+That is what an idle task is, so there is no separate one and no special case
+in the picker. It also means the "nothing is runnable" branch is unreachable in
+practice, which is why hitting it panics with a message rather than quietly
+resuming something that asked not to run.
+
+**Why blocked is not just "very low priority".** A blocked task is skipped
+entirely, not deprioritised. The highest priority task in the system, blocked,
+loses to the lowest priority runnable one. Modelling waiting as low priority
+instead would mean a blocked task runs the moment the machine is otherwise
+quiet, which is precisely when a waiting task must not run.
+
+**Why waking somebody more important costs you the CPU immediately.** `unblock`
+switches away on the spot if the woken task outranks the caller, rather than
+setting a flag for the next tick. Without that, "runs as soon as it is
+runnable" quietly means "runs within 10 milliseconds", and the priority scheme
+stops being worth having. It does make `unblock` a scheduling point, so nothing
+may be held across it that the woken task might want. Removing that switch
+still leaves a test that looks healthy: the woken task runs, just late, which
+is why the self test asserts on the order of four recorded turns rather than on
+whether each task had one.
 
 ## Layout
 
