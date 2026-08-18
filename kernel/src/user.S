@@ -222,6 +222,7 @@ user_server_start:
     mov     x8, #SYS_RECV
     mov     x0, x20
     mov     x1, #32
+    mov     x2, xzr                 // no notifications wanted
     svc     #0
     mov     x19, x0
     mov     x21, x1
@@ -469,6 +470,7 @@ user_borrower_start:
     mov     x8, #SYS_RECV
     mov     x0, x20
     mov     x1, #32
+    mov     x2, xzr                 // no notifications wanted
     svc     #0
     mov     x19, x0                 // the lender
     mov     x21, #0                 // accumulated failures
@@ -769,3 +771,175 @@ user_petitioner_start:
 
     .balign 4
 user_petitioner_end:
+
+// The heartbeat, as an unprivileged task.
+//
+// This used to be four lines in the timer interrupt handler. It is now a task
+// that waits for a notification, asks the kernel what the tick count is, and
+// formats the line itself. The kernel's part in a timer interrupt is down to
+// re-arming the deadline and setting a bit.
+//
+// It reads the count rather than counting the notifications it received, and
+// that is the point rather than an accident. Notifications collapse: if this
+// task does not get a turn for five ticks it is woken once. Counting wakeups
+// would drift, reading the count cannot.
+
+.set SYS_TICKS, 12
+.set TIMER_NOTE, 1
+
+    .section .text.user, "ax"
+    .global user_heartbeat_start
+    .global user_heartbeat_end
+
+user_heartbeat_start:
+    sub     sp, sp, #128
+    mov     x24, #0                 // last whole second reported
+
+.Lbeat:
+    // The one wait point. Nothing else to poll.
+    mov     x8, #SYS_RECV
+    mov     x0, xzr
+    mov     x1, xzr
+    mov     x2, #TIMER_NOTE
+    svc     #0
+
+    mov     x8, #SYS_TICKS
+    svc     #0
+    mov     x25, x0                 // ticks
+
+    mov     x3, #100
+    udiv    x26, x25, x3            // whole seconds
+    cmp     x26, x24
+    b.ls    .Lbeat
+    mov     x24, x26
+
+    // "uptime <secs>s (<ticks> ticks)\n", built a piece at a time.
+    mov     x23, sp                 // output cursor
+
+    adr     x1, .Luptime
+    mov     x2, #(.Luptime_end - .Luptime)
+    bl      .Lput
+
+    mov     x0, x26
+    bl      .Lnum
+
+    adr     x1, .Lsecs
+    mov     x2, #(.Lsecs_end - .Lsecs)
+    bl      .Lput
+
+    mov     x0, x25
+    bl      .Lnum
+
+    adr     x1, .Lticks
+    mov     x2, #(.Lticks_end - .Lticks)
+    bl      .Lput
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    mov     x1, sp
+    sub     x2, x23, x1
+    svc     #0
+
+    b       .Lbeat
+
+// Append x2 bytes from x1 at the cursor in x23.
+.Lput:
+    cbz     x2, .Lput_done
+.Lput_loop:
+    ldrb    w5, [x1], #1
+    strb    w5, [x23], #1
+    subs    x2, x2, #1
+    b.ne    .Lput_loop
+.Lput_done:
+    ret
+
+// Append x0 in decimal. Digits come out lowest first, so they are written
+// backwards into scratch above the line buffer and then copied forward.
+.Lnum:
+    add     x7, sp, #96
+    mov     x6, x7
+    mov     x3, #10
+.Lnum_loop:
+    udiv    x5, x0, x3
+    msub    x4, x5, x3, x0
+    add     w4, w4, #48
+    sub     x6, x6, #1
+    strb    w4, [x6]
+    mov     x0, x5
+    cbnz    x0, .Lnum_loop
+    sub     x2, x7, x6
+    mov     x1, x6
+    // Tail call, so x30 still points at whoever called us.
+    b       .Lput
+
+.Luptime:
+    .ascii  "uptime "
+.Luptime_end:
+.Lsecs:
+    .ascii  "s ("
+.Lsecs_end:
+.Lticks:
+    .ascii  " ticks)\n"
+.Lticks_end:
+
+    .balign 4
+user_heartbeat_end:
+
+// A task the kernel can post notifications to on a schedule it controls.
+//
+// The heartbeat proves notifications work end to end but says nothing about
+// the rules, because the timer only ever sets one bit and always the one being
+// waited for. This one is driven by the kernel so the awkward cases are
+// reachable at all.
+
+    .section .text.user, "ax"
+    .global user_notified_start
+    .global user_notified_end
+
+user_notified_start:
+    mov     x21, #0
+
+    // Wait for bit 0 only. The kernel posts bit 1 first, which must not wake
+    // us, and then bit 0, which must.
+    mov     x8, #SYS_RECV
+    mov     x0, xzr
+    mov     x1, xzr
+    mov     x2, #0b0001
+    svc     #0
+
+    // A notification is not from a task, and says so.
+    mov     x9, #-1
+    cmp     x0, x9
+    b.eq    .Lnotified_bits
+    orr     x21, x21, #1
+
+.Lnotified_bits:
+    // Exactly the bit asked for. Bit 1 was posted first and is none of our
+    // business yet, so collecting it here would mean a task asking about one
+    // event can silently discard another.
+    cmp     x1, #0b0001
+    b.eq    .Lnotified_second
+    orr     x21, x21, #2
+
+.Lnotified_second:
+    // Bit 1 was posted while we were not looking, so it is still waiting and
+    // this returns without blocking. If the first receive had cleared
+    // everything, this one waits forever.
+    mov     x8, #SYS_RECV
+    mov     x0, xzr
+    mov     x1, xzr
+    mov     x2, #0b0010
+    svc     #0
+    cmp     x1, #0b0010
+    b.eq    .Lnotified_exit
+    orr     x21, x21, #4
+
+.Lnotified_exit:
+    mov     x8, #SYS_EXIT
+    mov     x0, x21
+    svc     #0
+.Lnotified_stuck:
+    b       .Lnotified_stuck
+
+    .balign 4
+user_notified_end:

@@ -9,6 +9,7 @@ pub mod exceptions;
 pub mod frames;
 pub mod gic;
 pub mod ipc;
+pub mod notify;
 pub mod paging;
 pub mod semihosting;
 pub mod sync;
@@ -137,6 +138,7 @@ extern "C" fn kernel_main_high() -> ! {
     tasks::ipc_self_test();
     tasks::lease_self_test();
     tasks::supervisor_self_test();
+    tasks::notification_self_test();
     println!("tier 2: preemptive scheduling online.");
     println!("tier 2: EL0 and syscalls online.");
     println!("tier 3: task faults are contained.");
@@ -144,6 +146,13 @@ extern "C" fn kernel_main_high() -> ! {
     println!("tier 3: synchronous IPC online.");
     println!("tier 3: leases online.");
     println!("tier 3: supervised restart online.");
+    println!();
+
+    // Last, and never finishes. From here the heartbeat on the console is
+    // printed by an unprivileged task that the timer interrupt wakes, and the
+    // kernel's part in a tick is re-arming the deadline and setting one bit.
+    tasks::spawn_heartbeat();
+    println!("tier 3: notifications online, heartbeat now runs at EL0.");
     println!();
 
     halt()

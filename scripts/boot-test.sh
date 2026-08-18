@@ -91,12 +91,23 @@ EXPECTED=(
     "tier 3: supervised restart online"
     "tier 0 complete"
     "heartbeat started"
-    # Exact tick counts, not just "some output happened". Reaching 200 ticks
-    # means 200 timer interrupts were raised, forwarded by the GIC, claimed,
-    # dispatched, and acknowledged. A missing EOI or a dropped re-arm shows up
-    # here as the counter stalling.
-    "uptime 1s (100 ticks)"
-    "uptime 2s (200 ticks)"
+    # Reaching two seconds means 200 timer interrupts were raised, forwarded by
+    # the GIC, claimed, dispatched, and acknowledged. A missing EOI or a dropped
+    # re-arm shows up here as the counter stalling.
+    #
+    # The seconds are checked and the tick count is not. It used to be exact,
+    # because the kernel printed the line inside the interrupt handler. It is a
+    # task that prints it now, woken by a notification and reading the count
+    # back, so the count it sees is whatever it is when it gets a turn. Pinning
+    # it to 100 would be pinning the scheduler's timing, which is a different
+    # thing from what this line is here to check.
+    "uptime 1s ("
+    "uptime 2s ("
+    # The whole point of the tier: this line and the two above it are printed by
+    # an unprivileged task that a hardware interrupt woke.
+    "notification self test: passed"
+    "unwanted bit did not wake the task and was kept"
+    "tier 3: notifications online, heartbeat now runs at EL0"
 )
 
 # The run is not finished until the machine has proved it keeps running on its

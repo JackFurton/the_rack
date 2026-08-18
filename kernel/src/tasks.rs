@@ -1276,6 +1276,95 @@ pub fn supervisor_self_test() {
     );
 }
 
+/// Start the heartbeat driver and give it the timer interrupt.
+///
+/// Never finishes, unlike everything else spawned here. It is a permanent
+/// system task, so it goes up last, once the tests that count free frames have
+/// had their turn.
+pub fn spawn_heartbeat() -> TaskId {
+    let id = spawn_user_program(
+        "heartbeat",
+        (&raw const user_heartbeat_start) as u64,
+        (&raw const user_heartbeat_end) as u64,
+        0,
+        Priority::NORMAL,
+    );
+    crate::notify::route(crate::timer::TIMER_INTID, id, 1);
+    id
+}
+
+/// Post notifications on a schedule the kernel controls, and check the rules.
+///
+/// The heartbeat proves the path works end to end and nothing else: the timer
+/// only ever sets one bit, and always the one being waited for. Everything
+/// awkward about notifications needs a poster that can be told when to post.
+pub fn notification_self_test() {
+    reap_zombies();
+    release_dead();
+
+    let watcher = spawn_user_program(
+        "notified",
+        (&raw const user_notified_start) as u64,
+        (&raw const user_notified_end) as u64,
+        0,
+        Priority::HIGH,
+    );
+
+    // Let it get as far as its first receive and park there.
+    let deadline = crate::timer::ticks() + 100;
+    while !is_blocked(watcher) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the watcher never parked waiting for a notification"
+        );
+        yield_now();
+    }
+
+    // A bit it is not waiting for. Posting this must leave it exactly where it
+    // is: a task waiting on one event is not woken by a different one, or
+    // every driver becomes a poll loop with extra steps.
+    crate::notify::post(watcher, 0b0010);
+    assert!(
+        is_blocked(watcher),
+        "a notification nobody was waiting for woke a task anyway"
+    );
+
+    // The bit it is waiting for.
+    crate::notify::post(watcher, 0b0001);
+
+    let deadline = crate::timer::ticks() + 100;
+    while !finished(watcher) {
+        assert!(
+            crate::timer::ticks() < deadline,
+            "the watcher was never woken, or is still waiting for the bit it was already sent"
+        );
+        yield_now();
+    }
+
+    let code = exit_code(watcher).expect("watcher finished without an exit code");
+    reap_zombies();
+    release_dead();
+
+    assert_eq!(
+        code,
+        0,
+        "{}",
+        match code {
+            1 => "a notification arrived claiming to be from a task",
+            2 => "receiving one notification collected bits nobody had asked for",
+            _ => "a bit posted while the task was not looking was lost rather than kept",
+        }
+    );
+
+    assert!(canaries_intact(), "a kernel stack overflowed");
+
+    print!("notification self test: passed, ");
+    println!(
+        "unwanted bit did not wake the task and was kept, wanted bit did, \
+         and only the requested bits were collected"
+    );
+}
+
 // --- priorities and blocking ---
 
 /// Who ran, in the order they ran. The assertion for this tier is about
@@ -1497,6 +1586,10 @@ unsafe extern "C" {
     static user_supervisor_end: u8;
     static user_petitioner_start: u8;
     static user_petitioner_end: u8;
+    static user_heartbeat_start: u8;
+    static user_heartbeat_end: u8;
+    static user_notified_start: u8;
+    static user_notified_end: u8;
 }
 
 /// Drop to EL0 and start running `entry`.

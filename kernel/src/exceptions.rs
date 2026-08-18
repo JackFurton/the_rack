@@ -399,9 +399,22 @@ fn dispatch_irq() {
         return;
     }
 
-    match intid {
-        crate::timer::TIMER_INTID => crate::timer::on_tick(),
-        other => println!("unhandled IRQ {other}"),
+    // Whoever owns this line is told first. All the kernel does for a device
+    // interrupt is acknowledge it and set a bit; everything specific to the
+    // device happens later, in a task, at EL0.
+    let routed = crate::notify::on_irq(intid);
+
+    // The timer is the one line the kernel cannot hand over entirely, because
+    // preemption is the scheduler's business and the scheduler is not a task.
+    // It re-arms the deadline and asks for a reschedule here, and the driver
+    // that got the notification above deals with what the tick *means*.
+    let handled = intid == crate::timer::TIMER_INTID;
+    if handled {
+        crate::timer::on_tick();
+    }
+
+    if !routed && !handled {
+        println!("unhandled IRQ {intid}");
     }
 
     crate::gic::end_of_interrupt(intid);

@@ -33,6 +33,7 @@ pub const SYS_BORROW_WRITE: u64 = 8;
 pub const SYS_FAULT_WAIT: u64 = 9;
 pub const SYS_FAULT_INFO: u64 = 10;
 pub const SYS_RESTART: u64 = 11;
+pub const SYS_TICKS: u64 = 12;
 
 /// The caller is not allowed to ask this.
 const EPERM: u64 = -4i64 as u64;
@@ -77,13 +78,17 @@ pub fn dispatch(frame: &mut TrapFrame) {
             let (rc, len) = ipc::send(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
             (rc, len, 0)
         }
-        SYS_RECV => ipc::recv(a[0], a[1]),
+        SYS_RECV => ipc::recv(a[0], a[1], a[2]),
         SYS_REPLY => (ipc::reply(a[0], a[1], a[2], a[3]), 0, 0),
         SYS_BORROW_READ => (ipc::borrow_read(a[0], a[1], a[2], a[3], a[4]), 0, 0),
         SYS_BORROW_WRITE => (ipc::borrow_write(a[0], a[1], a[2], a[3], a[4]), 0, 0),
         SYS_FAULT_WAIT => (sys_fault_wait(), 0, 0),
         SYS_FAULT_INFO => sys_fault_info(a[0]),
         SYS_RESTART => (sys_restart(a[0]), 0, 0),
+        // The driver's stand-in for a device register. A notification says
+        // something happened; this is where the task finds out what, which is
+        // why collapsing two notifications into one costs it nothing.
+        SYS_TICKS => (crate::timer::ticks(), 0, 0),
         _ => (EINVAL, 0, 0),
     };
 
