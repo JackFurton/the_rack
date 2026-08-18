@@ -30,6 +30,12 @@ pub const SYS_RECV: u64 = 5;
 pub const SYS_REPLY: u64 = 6;
 pub const SYS_BORROW_READ: u64 = 7;
 pub const SYS_BORROW_WRITE: u64 = 8;
+pub const SYS_FAULT_WAIT: u64 = 9;
+pub const SYS_FAULT_INFO: u64 = 10;
+pub const SYS_RESTART: u64 = 11;
+
+/// The caller is not allowed to ask this.
+const EPERM: u64 = -4i64 as u64;
 
 /// Returned for anything we do not recognise or will not do.
 ///
@@ -75,6 +81,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_REPLY => (ipc::reply(a[0], a[1], a[2], a[3]), 0, 0),
         SYS_BORROW_READ => (ipc::borrow_read(a[0], a[1], a[2], a[3], a[4]), 0, 0),
         SYS_BORROW_WRITE => (ipc::borrow_write(a[0], a[1], a[2], a[3], a[4]), 0, 0),
+        SYS_FAULT_WAIT => (sys_fault_wait(), 0, 0),
+        SYS_FAULT_INFO => sys_fault_info(a[0]),
+        SYS_RESTART => (sys_restart(a[0]), 0, 0),
         _ => (EINVAL, 0, 0),
     };
 
@@ -94,6 +103,54 @@ fn sys_yield() -> u64 {
 
 fn sys_getpid() -> u64 {
     tasks::current_id().0 as u64
+}
+
+/// Only the supervisor may ask about or act on other tasks' faults.
+///
+/// Checked before anything else these calls do, including whether the target
+/// makes sense. Otherwise the error code leaks the answer: a task told
+/// "no such faulted task" has learned that there is no such faulted task, which
+/// is exactly the thing it was not supposed to be able to find out.
+fn supervising() -> bool {
+    tasks::is_supervisor(tasks::current_id())
+}
+
+fn sys_fault_wait() -> u64 {
+    if !supervising() {
+        return EPERM;
+    }
+    tasks::wait_for_fault()
+}
+
+/// What stopped a task: the syndrome register, the faulting address, and the
+/// instruction that did it.
+fn sys_fault_info(id: u64) -> (u64, u64, u64) {
+    if !supervising() {
+        return (EPERM, 0, 0);
+    }
+    if id as usize >= tasks::MAX_TASKS {
+        return (EINVAL, 0, 0);
+    }
+
+    match tasks::fault_of(tasks::TaskId(id as usize)) {
+        Some(fault) => (fault.esr, fault.far, fault.elr),
+        None => (EINVAL, 0, 0),
+    }
+}
+
+fn sys_restart(id: u64) -> u64 {
+    if !supervising() {
+        return EPERM;
+    }
+    if id as usize >= tasks::MAX_TASKS {
+        return EINVAL;
+    }
+
+    if tasks::restart(tasks::TaskId(id as usize)) {
+        0
+    } else {
+        EINVAL
+    }
 }
 
 /// Write `len` bytes from `buf` to the console.

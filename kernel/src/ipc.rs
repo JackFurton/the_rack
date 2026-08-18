@@ -509,8 +509,8 @@ pub fn reply(sender: u64, rc: u64, data: u64, data_len: u64) -> u64 {
     0
 }
 
-/// Hand a blocked sender its result and put it back in the running.
-fn finish_sender(sender: TaskId, rc: u64, len: u64) {
+/// Record what a blocked sender is about to be told, without waking it.
+fn deliver_outcome(sender: TaskId, rc: u64, len: u64) {
     {
         let mut table = TABLE.lock();
         table.outcome[sender.0] = Outcome {
@@ -537,6 +537,14 @@ fn finish_sender(sender: TaskId, rc: u64, len: u64) {
         // merely out of date.
         table.leases[sender.0] = [NO_LEASE; MAX_LEASES];
     }
+}
+
+/// Hand a blocked sender its result and put it back in the running.
+///
+/// Wakes immediately, which for `reply` is the whole point: the sender has been
+/// waiting for exactly this and should not have to wait out a tick as well.
+fn finish_sender(sender: TaskId, rc: u64, len: u64) {
+    deliver_outcome(sender, rc, len);
     tasks::unblock(sender);
 }
 
@@ -592,7 +600,13 @@ pub fn abandon(gone: TaskId) {
         };
 
         if waiting_on_gone {
-            finish_sender(TaskId(slot), EDEAD, 0);
+            // Deferred, not immediate. Every caller of this is a task on its
+            // way out, and an immediate handoff to a higher priority mourner
+            // would never come back, leaving the rest of the dying task's
+            // affairs unsettled: other senders still waiting, and in the fault
+            // case a supervisor that never hears what happened.
+            deliver_outcome(TaskId(slot), EDEAD, 0);
+            tasks::unblock_deferred(TaskId(slot));
         }
     }
 

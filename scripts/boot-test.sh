@@ -82,6 +82,13 @@ EXPECTED=(
     "buffer lent and written across address spaces"
     "stale lease all refused"
     "tier 3: leases online"
+    # Three fault reports, not one: the earlier containment test, then the
+    # victim, then the victim again after being restarted. A restart that
+    # silently did nothing would leave two.
+    "supervisor self test: passed"
+    "restarted it with clean memory and the same id"
+    "blocked sender released"
+    "tier 3: supervised restart online"
     "tier 0 complete"
     "heartbeat started"
     # Exact tick counts, not just "some output happened". Reaching 200 ticks
