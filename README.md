@@ -78,10 +78,13 @@ lifecycle self test: passed, task took 11 frames and gave back all 11
 ------------------
 fault self test: passed, task died on translation fault, kernel survived
 priority self test: passed, high ran to completion before low, blocked task skipped
+ipc: server received ping
+ipc self test: passed, message and reply survived both directions across two address spaces
 tier 2: preemptive scheduling online.
 tier 2: EL0 and syscalls online.
 tier 3: task faults are contained.
 tier 3: priority scheduling and blocking online.
+tier 3: synchronous IPC online.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -293,6 +296,46 @@ may be held across it that the woken task might want. Removing that switch
 still leaves a test that looks healthy: the woken task runs, just late, which
 is why the self test asserts on the order of four recorded turns rather than on
 whether each task had one.
+
+**Why message passing is a rendezvous with no queue.** `send` blocks until the
+target replies. There is no buffer in the middle and no allocation on the send
+path: every message in flight is described by two buffers belonging to the two
+tasks involved, and the kernel copies between them exactly once. One decision
+that pays three times. There is no queue to size, so there is no wrong size to
+pick. The kernel allocates nothing, so a task cannot exhaust kernel memory by
+sending faster than anybody listens. And back pressure is free, because a
+sender that outruns its receiver blocks, which is information about the system
+rather than a slow leak of it. The cost is real: a send to a task that never
+receives waits forever, so who may send to whom becomes a design decision
+rather than an accident. Hubris answers that with an ordering on senders.
+Nothing enforces one here yet.
+
+**Why the kernel does the copying, twice validated.** Neither task can see the
+other's memory, which was the entire point of tier 2's address spaces, so the
+kernel reads the sender's buffer and writes the receiver's. Each side is
+checked against *its own owner's* page tables, not against whoever happens to
+be running. The receiver is the task on the CPU when a queued message is
+collected, and validating the sender's pointer against the receiver's tables
+would let a receiver name any address it liked and have the kernel treat it as
+the sender's. The copy goes through the high half physical map rather than
+swapping `TTBR0_EL1` twice per chunk, because the high half already maps all of
+physical memory and both sides are reachable at once.
+
+**Why blocking is two calls and not one.** `mark_current_blocked` takes a task
+out of the run queue; `park` actually stops it. A task about to wake somebody
+else has to be out of the queue *before* it does the waking, because the woken
+task can answer immediately and an answer that arrives while the sender still
+looks runnable is a wakeup delivered to nobody. `park` is then conditional on
+still being blocked, because by the time it is reached the thing being waited
+for may already have happened. Writing this as one call deadlocked on the first
+message the kernel ever sent.
+
+**Why an answered sender is cleared by whoever answered it.** `pending` means
+"what this task is waiting for right now", and the instant an outcome is
+written it is waiting for nothing. Leaving the flag for the sender to clear
+when it next runs opened a window where the reply had been delivered but the
+sender still looked like it was waiting on its replier, and the replier exiting
+a few instructions later overwrote a perfectly good reply with `EDEAD`.
 
 ## Layout
 

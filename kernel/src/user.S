@@ -87,3 +87,218 @@ user_fault_start:
 
     .balign 4
 user_fault_end:
+
+// A pair of programs that exchange a message.
+//
+// Two separate blobs, copied into two separate address spaces, sharing nothing
+// but the syscall interface. That is the point: neither can see the other's
+// memory, so every byte that crosses between them was carried by the kernel.
+//
+// Each blob carries its own copy of the literals it compares against. They
+// cannot share one, because a blob is copied into a page on its own and an
+// `adr` in one would be pointing into memory the other does not have.
+
+.set SYS_SEND,  4
+.set SYS_RECV,  5
+.set SYS_REPLY, 6
+
+// Exit codes, so a failure says which check failed rather than just "not zero".
+.set FAIL_RC,   1
+.set FAIL_LEN,  2
+.set FAIL_BODY, 3
+.set FAIL_DEAD, 4
+
+    .section .text.user, "ax"
+    .global user_client_start
+    .global user_client_end
+
+user_client_start:
+    // The kernel planted the server's task id in the top word of the stack.
+    ldr     x19, [sp, #8]
+
+    // Scratch for the reply. The stack page is the only writable memory this
+    // task has, and the kernel is about to write into it on our behalf, so it
+    // has to be somewhere we genuinely own.
+    sub     sp, sp, #64
+    mov     x20, sp
+
+    // send(server, 0x51, "ping", 4, reply, 32)
+    mov     x8, #SYS_SEND
+    mov     x0, x19
+    mov     x1, #0x51
+    adr     x2, .Lping
+    mov     x3, #(.Lping_end - .Lping)
+    mov     x4, x20
+    mov     x5, #32
+    svc     #0
+
+    // x0 is whatever the server passed to reply, x1 is how much of its answer
+    // fitted in our buffer.
+    cmp     x0, #0
+    b.ne    .Lfail_rc
+    cmp     x1, #(.Lpong_end - .Lpong)
+    b.ne    .Lfail_len
+
+    // Compare the reply byte for byte. A length on its own would pass on a
+    // copy that moved the right number of wrong bytes.
+    adr     x2, .Lpong
+    mov     x3, #(.Lpong_end - .Lpong)
+    mov     x4, x20
+.Lcompare:
+    ldrb    w5, [x2], #1
+    ldrb    w6, [x4], #1
+    cmp     w5, w6
+    b.ne    .Lfail_body
+    subs    x3, x3, #1
+    b.ne    .Lcompare
+
+    // Give the server time to reply to us and then exit, so the next send has
+    // a corpse to talk to.
+    mov     x21, #16
+.Lwait:
+    mov     x8, #SYS_YIELD
+    svc     #0
+    subs    x21, x21, #1
+    b.ne    .Lwait
+
+    // Sending to a task that has gone must come back as an error. The
+    // alternative is a wait that nothing will ever end.
+    mov     x8, #SYS_SEND
+    mov     x0, x19
+    mov     x1, #0x51
+    adr     x2, .Lping
+    mov     x3, #(.Lping_end - .Lping)
+    mov     x4, x20
+    mov     x5, #32
+    svc     #0
+    mov     x9, #-3                 // EDEAD
+    cmp     x0, x9
+    b.ne    .Lfail_dead
+
+    mov     x0, #0
+    b       .Lclient_exit
+
+.Lfail_rc:
+    mov     x0, #FAIL_RC
+    b       .Lclient_exit
+.Lfail_len:
+    mov     x0, #FAIL_LEN
+    b       .Lclient_exit
+.Lfail_body:
+    mov     x0, #FAIL_BODY
+    b       .Lclient_exit
+.Lfail_dead:
+    mov     x0, #FAIL_DEAD
+
+.Lclient_exit:
+    mov     x8, #SYS_EXIT
+    svc     #0
+.Lclient_stuck:
+    b       .Lclient_stuck
+
+.Lping:
+    .ascii  "ping"
+.Lping_end:
+.Lpong:
+    .ascii  "pong!"
+.Lpong_end:
+
+    .balign 4
+user_client_end:
+
+    .section .text.user, "ax"
+    .global user_server_start
+    .global user_server_end
+
+user_server_start:
+    sub     sp, sp, #64
+    mov     x20, sp
+
+    // recv(buf, 32) -> x0 sender, x1 operation, x2 length
+    mov     x8, #SYS_RECV
+    mov     x0, x20
+    mov     x1, #32
+    svc     #0
+    mov     x19, x0
+    mov     x21, x1
+    mov     x22, x2
+
+    // Put the payload on the console. Without this the exchange is only ever
+    // two programs agreeing with each other; printing it means the bytes are
+    // visible from outside both of them.
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    adr     x1, .Lgot
+    mov     x2, #(.Lgot_end - .Lgot)
+    svc     #0
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    mov     x1, x20
+    mov     x2, x22
+    svc     #0
+
+    mov     x8, #SYS_WRITE
+    mov     x0, #1
+    adr     x1, .Lnewline
+    mov     x2, #1
+    svc     #0
+
+    // x23 is the return code: zero unless something about the message is
+    // wrong. Checked here rather than only in the client, because the message
+    // has to arrive intact in both directions.
+    mov     x23, #0
+
+    cmp     x21, #0x51
+    b.eq    .Lop_ok
+    mov     x23, #1
+    b       .Lanswer
+.Lop_ok:
+    cmp     x22, #(.Lexpect_end - .Lexpect)
+    b.eq    .Lsize_ok
+    mov     x23, #1
+    b       .Lanswer
+.Lsize_ok:
+    adr     x2, .Lexpect
+    mov     x3, x22
+    mov     x4, x20
+.Lserver_compare:
+    ldrb    w5, [x2], #1
+    ldrb    w6, [x4], #1
+    cmp     w5, w6
+    b.eq    .Lserver_same
+    mov     x23, #1
+    b       .Lanswer
+.Lserver_same:
+    subs    x3, x3, #1
+    b.ne    .Lserver_compare
+
+.Lanswer:
+    // reply(sender, rc, "pong!", 5)
+    mov     x8, #SYS_REPLY
+    mov     x0, x19
+    mov     x1, x23
+    adr     x2, .Lanswer_body
+    mov     x3, #(.Lanswer_body_end - .Lanswer_body)
+    svc     #0
+
+    mov     x8, #SYS_EXIT
+    mov     x0, x23
+    svc     #0
+.Lserver_stuck:
+    b       .Lserver_stuck
+
+.Lgot:
+    .ascii  "ipc: server received "
+.Lgot_end:
+.Lnewline:
+    .ascii  "\n"
+.Lexpect:
+    .ascii  "ping"
+.Lexpect_end:
+.Lanswer_body:
+    .ascii  "pong!"
+.Lanswer_body_end:
+
+    .balign 4
+user_server_end:
