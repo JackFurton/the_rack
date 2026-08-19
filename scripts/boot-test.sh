@@ -49,6 +49,12 @@ EXPECTED=(
     # Discovery, not a constant: this line is built from whatever -m the runner
     # was given, so a kernel that ignored the tree fails here at any other size.
     "memory        : $MEMORY_MIB MiB at 0x40000000, from the tree"
+    # The console and the interrupt controller, found rather than assumed. Both
+    # lines are printed after the addresses have been taken from the tree and
+    # handed to the drivers, and the kernel keeps talking afterwards, which is
+    # the part that would not survive a wrong address.
+    "console       : 0x0009000000 + 0x1000, where we were already talking"
+    "interrupts    : dist 0x0008000000 cpu 0x0008010000, as assumed"
     # The parser walked the tree QEMU built and agreed with the frame allocator
     # about where RAM is. It is checked against handcrafted trees too, but this
     # line only appears when the live one was read.

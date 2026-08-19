@@ -271,8 +271,14 @@ fn symbol(sym: &u8) -> u64 {
     (sym as *const u8) as u64
 }
 
-/// Device MMIO we currently touch: GIC distributor at 0x0800_0000, GIC CPU
-/// interface at 0x0801_0000, PL011 UART at 0x0900_0000.
+/// The device window mapped before anything has been discovered: GIC
+/// distributor at 0x0800_0000, GIC CPU interface at 0x0801_0000, PL011 UART at
+/// 0x0900_0000. Enough to have a console and an interrupt controller, which is
+/// enough to read the device tree and find out where they really are.
+///
+/// Mapped in 2 MiB blocks, which is why anything discovered inside it is left
+/// alone rather than mapped again: mapping a 4 KiB page inside an existing
+/// block would walk into a block descriptor as though it were a table.
 const DEVICE_BASE: u64 = 0x0800_0000;
 const DEVICE_SIZE: u64 = 32 * 1024 * 1024;
 
@@ -455,6 +461,49 @@ pub fn map_physical(root: Frame, pa: u64, size: u64) {
         end - start,
         Attributes::kernel_data(),
     );
+}
+
+/// Map a device's registers into the kernel's half, once the MMU is on.
+///
+/// Returns whether anything was mapped. The bootstrap window already covers
+/// the console and the interrupt controller on this machine, so discovering
+/// them changes nothing; a device outside it, like the virtio transports, is
+/// mapped here.
+pub fn map_device(pa: u64, size: u64) -> bool {
+    let start = pa / PAGE_SIZE * PAGE_SIZE;
+    let end = (pa + size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let window = DEVICE_BASE..DEVICE_BASE + DEVICE_SIZE;
+
+    if window.contains(&start) && end <= window.end {
+        return false;
+    }
+
+    // Half in and half out would mean mapping pages inside an existing block,
+    // and there is no reason for a device to straddle that boundary.
+    assert!(
+        !window.contains(&start) && !window.contains(&(end - 1)),
+        "device at {pa:#x} straddles the bootstrap device window"
+    );
+
+    map_range(
+        kernel_root(),
+        start + KERNEL_BASE,
+        start,
+        end - start,
+        Attributes::device(),
+    );
+
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+
+    true
 }
 
 /// The page table root the kernel's own half of memory is translated with.
