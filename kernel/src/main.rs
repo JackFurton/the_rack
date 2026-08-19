@@ -49,15 +49,42 @@ unsafe extern "C" {
 pub extern "C" fn kernel_main(dtb: u64) -> ! {
     uart::emergency_print("\nthe_rack: booting, mmu off\n");
 
+    // The header of the device tree, and nothing else. Reading the tree
+    // properly means comparing strings, and the address of a string literal
+    // here is a high half address that nothing translates yet, so that has to
+    // wait for the MMU. The header is ten `u32` at fixed offsets and needs no
+    // strings at all, which is enough to learn how much room the blob takes.
+    let blob = fdt::early_probe(dtb);
+
     // PC relative addressing means the linker symbols this reads resolve to
     // physical addresses right now, and to high ones after the jump, with no
     // relocation and no special casing.
-    frames::init();
+    //
+    // The memory map is a guess until the tree can be read. It only has to be
+    // large enough to allocate page tables out of, and it is corrected as soon
+    // as the kernel is running somewhere the tree makes sense.
+    frames::init(frames::DEFAULT_RAM_BASE, frames::DEFAULT_RAM_SIZE);
     uart::emergency_print("the_rack: frame allocator up, building page tables\n");
 
     // Build both roots while the MMU is off, enable with the identity map
     // holding the program counter steady, then leave the low half behind.
     let (ttbr0, ttbr1) = paging::build_tables();
+
+    // The blob is not necessarily inside the window the kernel guessed at: on
+    // `virt` it is, at 128 MiB up, but that is a QEMU decision and not a rule.
+    // Anything outside gets mapped explicitly, so the high half can read the
+    // tree whatever the machine did with it.
+    //
+    // Only outside. The guessed window is already mapped, in 2 MiB blocks, and
+    // mapping a page inside one would mean splitting a block descriptor, which
+    // this page table code does not do.
+    if let Some((pa, size)) = blob {
+        let guessed_end = frames::ram_base() + frames::ram_size();
+        if pa < frames::ram_base() || pa + size > guessed_end {
+            paging::map_physical(ttbr1, pa, size);
+        }
+    }
+
     uart::emergency_print("the_rack: tables built, enabling mmu\n");
 
     unsafe { paging::enable(ttbr0, ttbr1) };
@@ -97,25 +124,25 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
 
     paging::print_config();
     println!();
-    frames::print_map();
-    println!();
 
-    // The first thing this kernel has been told rather than told itself.
-    // Nothing depends on it yet: every address it would supply is still a
-    // constant, and will be until #42 and #43. Getting it validated and
-    // printed first means the rest of tier 4 starts from something known good.
+    // Before the map is printed, because until the tree has been read it is a
+    // guess and printing a guess as though it were the machine is how a wrong
+    // number survives for two tiers.
     match fdt::init(dtb) {
         Ok(blob) => {
             fdt::print_info(&blob);
-            reserve_blob(&blob);
+            adopt_memory_map(&blob);
         }
         Err(error) => {
             println!(
-                "device tree: none ({}), carrying on with constants",
+                "device tree: none ({}), memory map stays a guess",
                 error.describe()
             );
         }
     }
+    println!();
+
+    frames::print_map();
     println!();
 
     exceptions::self_test();
@@ -186,33 +213,85 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
     halt()
 }
 
-/// Keep the allocator's hands off the device tree.
+/// Replace the guessed memory map with the one the machine describes.
 ///
-/// QEMU does not put the blob at the base of RAM, which is what this project
-/// assumed until it could actually see one: on `virt` it lands 128 MiB up,
-/// well past the kernel image and squarely inside the pool. Nothing has read
-/// the tree yet, so the corruption would have been invisible until #41 tried
-/// to walk it and found somebody's page table in the middle.
+/// Everything up to here has been running on `DEFAULT_RAM_SIZE`, which is a
+/// number this kernel made up. It was enough to allocate page tables from, and
+/// that is all it was ever meant to be.
 ///
-/// A failure here is a warning rather than a panic. The tree is not load
-/// bearing yet, and a kernel that boots and complains is more useful than one
-/// that dies over memory it is not using.
-fn reserve_blob(blob: &fdt::Blob) {
-    let size = blob.header.totalsize as u64;
+/// Order matters. The physical map has to cover the new memory before the
+/// allocator will hand any of it out, or the first page table that lands up
+/// there faults on a kernel address that does not translate. Reservations come
+/// last, since they are only meaningful once the range they live in exists.
+fn adopt_memory_map(blob: &fdt::Blob) {
+    let map = fdt::memory_map(blob);
 
-    match frames::reserve_range(blob.pa, size) {
-        Ok(count) => {
-            assert!(frames::is_taken(blob.pa), "the first frame is not held");
-            assert!(
-                frames::is_taken(blob.pa + size - 1),
-                "the last frame is not held"
-            );
-            println!("  reserved      : {} frames", count);
-        }
-        Err(error) => {
-            println!("  WARNING       : could not reserve the blob ({:?})", error);
+    if map.size == 0 {
+        println!("  memory        : no /memory node, keeping the guess");
+        return;
+    }
+
+    if map.banks > 1 {
+        println!(
+            "  WARNING       : {} memory banks, using the first",
+            map.banks
+        );
+    }
+
+    let old_end = frames::ram_base() + frames::ram_size();
+    let new_end = map.base + map.size.min(frames::MAX_RAM);
+    paging::extend_physical_map(old_end, new_end);
+
+    let outcome = frames::adopt(map.base, map.size);
+
+    // Printed from the allocator rather than from the tree, deliberately. The
+    // tree's number is only interesting once something acted on it, and a line
+    // that reads back what was just parsed would say the same thing whether or
+    // not the allocator ever heard about it.
+    println!(
+        "  memory        : {} MiB at {:#x}, from the tree",
+        frames::ram_size() / 1024 / 1024,
+        frames::ram_base()
+    );
+
+    match outcome {
+        Ok(0) => println!("  frames        : the guess was right"),
+        Ok(change) if change > 0 => println!("  frames        : {change} more than guessed"),
+        Ok(change) => println!("  frames        : {} fewer than guessed", -change),
+        Err(error) => println!("  WARNING       : cannot use this map ({error:?})"),
+    }
+
+    // Memory that is in RAM and is not ours: the blob itself, whatever the
+    // firmware put in the header's reservation block, and anything in
+    // `/reserved-memory`.
+    let mut reserved = 0;
+    for (base, size) in map.reserved() {
+        match frames::reserve_range(*base, *size) {
+            Ok(frames) => reserved += frames,
+            Err(error) => println!("  WARNING       : {base:#x} not reserved ({error:?})"),
         }
     }
+
+    if map.dropped > 0 {
+        println!(
+            "  WARNING       : {} reserved regions did not fit",
+            map.dropped
+        );
+    }
+
+    // The blob is the reservation every machine has, and the one whose absence
+    // would be silent: nothing reads the tree again until later in tier 4, by
+    // which time whatever overwrote it is long gone.
+    assert!(
+        frames::is_taken(blob.pa),
+        "the device tree was not reserved"
+    );
+    assert!(
+        frames::is_taken(blob.pa + blob.header.totalsize as u64 - 1),
+        "the end of the device tree was not reserved"
+    );
+
+    println!("  reserved      : {reserved} frames, blob included");
 }
 
 /// Which privilege level did the firmware drop us into?

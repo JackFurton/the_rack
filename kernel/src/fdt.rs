@@ -21,6 +21,25 @@
 //! in a register and passing it as an argument sidesteps both. It is only a
 //! `u64`, and it costs nothing to hand along.
 //!
+//! # Why the tree cannot be read before the MMU is on
+//!
+//! It would be convenient to read it there: the memory map is wanted before
+//! the frame allocator exists, and the allocator exists before paging does.
+//! The obstacle is not the blob, which sits at a physical address that works
+//! perfectly. It is that comparing a string means calling `memcmp` with the
+//! address of a string literal, and the kernel is linked at its high half
+//! address, so that literal's address is a high one. With the MMU off nothing
+//! translates it and the load takes a data abort, at a point in boot where the
+//! vector table is not installed, which shows as the machine stopping with no
+//! output at all.
+//!
+//! Nothing in Rust lets a function say "reach your constants PC relatively".
+//! `adrp` happens where the compiler chooses, and the moment a `&str` is
+//! passed to something that was not inlined, its absolute address is what
+//! travels. So the boot path reads only the header, whose ten fields are `u32`
+//! at fixed offsets and need no strings at all, and everything that involves a
+//! name waits until the kernel is running in the high half.
+//!
 //! # Why the header is checked before it is believed
 //!
 //! The blob is the one piece of input this kernel takes from outside itself.
@@ -30,7 +49,7 @@
 //! checking has to be written now: the first machine that hands us a bad one
 //! will not be the one we are testing on.
 
-use crate::frames::{RAM_BASE, RAM_SIZE};
+use crate::frames;
 use crate::paging;
 use crate::sync::Lock;
 use crate::{print, println};
@@ -217,20 +236,150 @@ pub fn init(pa: u64) -> Result<Blob, Error> {
 
     // Bound the read before making it. `probe` is safe to call only on memory
     // that is mapped, and the physical map covers RAM and nothing else.
-    if pa < RAM_BASE || pa.saturating_add(HEADER_SIZE as u64) > RAM_BASE + RAM_SIZE {
+    if pa < frames::ram_base()
+        || pa.saturating_add(HEADER_SIZE as u64) > frames::ram_base() + frames::ram_size()
+    {
         return Err(Error::OutsideRam(pa));
     }
 
     let va = paging::phys_to_virt(pa);
     let header = unsafe { probe(va) }?;
 
-    if pa + header.totalsize as u64 > RAM_BASE + RAM_SIZE {
+    if pa + header.totalsize as u64 > frames::ram_base() + frames::ram_size() {
         return Err(Error::OutsideRam(pa));
     }
 
     let blob = Blob { pa, va, header };
     *BLOB.lock() = Some(blob);
     Ok(blob)
+}
+
+/// How many reserved regions the memory map will carry.
+///
+/// `virt` declares none at all today. Eight is room for the blob itself plus
+/// whatever a real machine puts in `/reserved-memory`, which on hardware is
+/// usually a framebuffer, a secure world carve-out, or firmware scratch.
+pub const MAX_RESERVATIONS: usize = 8;
+
+/// What the tree says about memory.
+#[derive(Clone, Copy)]
+pub struct MemoryMap {
+    pub base: u64,
+    pub size: u64,
+    /// How many entries `/memory`'s `reg` had. More than one means the machine
+    /// has several banks and we are using the first.
+    pub banks: usize,
+    pub reservations: [(u64, u64); MAX_RESERVATIONS],
+    pub reservation_count: usize,
+    /// Reservations that did not fit. Never zero silently.
+    pub dropped: usize,
+}
+
+impl MemoryMap {
+    fn empty() -> Self {
+        MemoryMap {
+            base: 0,
+            size: 0,
+            banks: 0,
+            reservations: [(0, 0); MAX_RESERVATIONS],
+            reservation_count: 0,
+            dropped: 0,
+        }
+    }
+
+    fn reserve(&mut self, base: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        if self.reservation_count == MAX_RESERVATIONS {
+            self.dropped += 1;
+            return;
+        }
+        self.reservations[self.reservation_count] = (base, size);
+        self.reservation_count += 1;
+    }
+
+    /// The regions that must not be handed out.
+    pub fn reserved(&self) -> &[(u64, u64)] {
+        &self.reservations[..self.reservation_count]
+    }
+}
+
+/// Find out how big the blob is, with the MMU still off.
+///
+/// The header and nothing else, because the header is ten `u32` at known
+/// offsets and reading it needs no strings. Everything else about the tree has
+/// to wait: see the module docs on why the boot path cannot compare a string.
+///
+/// The answer is needed early because the blob has to be mapped before it can
+/// be read properly, and it is not necessarily inside the window the kernel
+/// guesses at while it has nothing better.
+pub fn early_probe(dtb_pa: u64) -> Option<(u64, u64)> {
+    if dtb_pa == 0 {
+        return None;
+    }
+
+    let header = unsafe { probe(dtb_pa) }.ok()?;
+    Some((dtb_pa, header.totalsize as u64))
+}
+
+/// Everything the tree says about memory: where it is, and what is spoken for.
+///
+/// Runs in the high half, where strings work.
+pub fn memory_map(blob: &Blob) -> MemoryMap {
+    let mut map = MemoryMap::empty();
+
+    // The blob is memory somebody else owns, sitting in the middle of the
+    // memory we are about to start handing out.
+    map.reserve(blob.pa, blob.header.totalsize as u64);
+
+    // The header's own reservation block: pairs of big endian u64, ended by a
+    // pair of zeroes. Older than `/reserved-memory` and still where firmware
+    // puts the regions it wants kept.
+    let mut offset = blob.header.off_mem_rsvmap;
+    while let (Some(base), Some(size)) = (blob.u64_at(offset), blob.u64_at(offset + 8)) {
+        if base == 0 && size == 0 {
+            break;
+        }
+        map.reserve(base, size);
+        offset += 16;
+    }
+
+    // `/reserved-memory` children, which is where a modern tree puts them.
+    if let Some(parent) = blob.find_node("/reserved-memory") {
+        let mut walker = blob.walk();
+        while let Some(step) = walker.next() {
+            let Step::Node(node, _) = step else { continue };
+            if node.offset <= parent.offset {
+                continue;
+            }
+            if node.depth <= parent.depth {
+                break;
+            }
+            if node.depth == parent.depth + 1
+                && let Some((base, size)) = blob.reg(&node, 0)
+            {
+                map.reserve(base, size);
+            }
+        }
+    }
+
+    if let Some(memory) = blob.find_node("/memory")
+        && let Some((base, size)) = blob.reg(&memory, 0)
+        && size != 0
+    {
+        map.base = base;
+        map.size = size;
+        map.banks = blob
+            .property(&memory, "reg")
+            .map(|value| {
+                let entry = ((memory.address_cells + memory.size_cells) * 4) as usize;
+                value.len() / entry.max(1)
+            })
+            .unwrap_or(1);
+    }
+
+    map
 }
 
 /// The device tree, if there is one.
@@ -329,6 +478,13 @@ impl Blob {
         Some(unsafe { be32(self.va, offset) })
     }
 
+    /// Read a big endian `u64` at `offset`, if it is inside the blob.
+    fn u64_at(&self, offset: u32) -> Option<u64> {
+        let high = self.u32_at(offset)? as u64;
+        let low = self.u32_at(offset + 4)? as u64;
+        Some((high << 32) | low)
+    }
+
     /// Borrow `len` bytes at `offset`, if they are inside the blob.
     ///
     /// The `'static` is honest: the blob is reserved out of the frame
@@ -402,7 +558,7 @@ impl Blob {
     /// One property of a node by name.
     pub fn property(&self, node: &Node, name: &str) -> Option<&'static [u8]> {
         self.properties(node)
-            .find(|(found, _)| *found == name)
+            .find(|(found, _)| same(found.as_bytes(), name.as_bytes()))
             .map(|(_, value)| value)
     }
 
@@ -695,16 +851,45 @@ fn read_cells(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(bytes))
 }
 
+/// Compare bytes in the blob against bytes we compiled in, one at a time.
+///
+/// The obvious `==` faults, and only sometimes, which is the worst way for
+/// something to fault. Before the MMU is on there are no page tables and no
+/// memory attributes, so the architecture treats every access as Device
+/// memory, and Device memory forbids unaligned accesses outright. `==` on two
+/// strings is `memcmp`, which reads eight or sixteen bytes at a time from
+/// wherever the string happens to start, and property names in the strings
+/// block start wherever the previous one ended. The first comparison against
+/// an oddly aligned name takes an alignment fault, at a point in boot where
+/// the vector table is not installed yet, so the machine simply stops with no
+/// output at all.
+///
+/// `read_volatile` is what keeps this a byte at a time. A plain loop is free
+/// to be vectorised back into the wide loads we are avoiding.
+fn same(blob_bytes: &[u8], want: &[u8]) -> bool {
+    if blob_bytes.len() != want.len() {
+        return false;
+    }
+
+    for (index, expected) in want.iter().enumerate() {
+        if unsafe { core::ptr::read_volatile(&blob_bytes[index]) } != *expected {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Does this node name match this path component?
 ///
 /// `memory@40000000` matches `memory`, because the part after `@` is the unit
 /// address and a caller asking for a path by name should not have to know it.
 fn name_matches(name: &str, component: &str) -> bool {
-    if name == component {
+    if same(name.as_bytes(), component.as_bytes()) {
         return true;
     }
     match name.split_once('@') {
-        Some((base, _)) => base == component,
+        Some((base, _)) => same(base.as_bytes(), component.as_bytes()),
         None => false,
     }
 }
@@ -716,7 +901,7 @@ fn name_matches(name: &str, component: &str) -> bool {
 /// generic one it is compatible with.
 pub fn string_list_contains(list: &[u8], wanted: &str) -> bool {
     list.split(|byte| *byte == 0)
-        .any(|entry| entry == wanted.as_bytes())
+        .any(|entry| same(entry, wanted.as_bytes()))
 }
 
 /// A device tree header built by hand, so the checks can be aimed at something
@@ -1040,9 +1225,14 @@ pub fn tree_self_test() {
             .expect("the live tree has no memory");
         let (base, size) = live.reg(&memory, 0).expect("no reg on /memory");
 
-        assert_eq!(base, RAM_BASE, "the tree disagrees about where RAM starts");
         assert_eq!(
-            size, RAM_SIZE,
+            base,
+            frames::ram_base(),
+            "the tree disagrees about where RAM starts"
+        );
+        assert_eq!(
+            size,
+            frames::ram_size(),
             "the tree disagrees about how much RAM there is"
         );
 

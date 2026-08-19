@@ -15,6 +15,10 @@ cargo run
 Boots the kernel on the QEMU `virt` machine with its UART on your terminal.
 `Ctrl-A` then `X` quits.
 
+`scripts/boot-test.sh` boots it headless and checks the console. `MEMORY=512M
+scripts/boot-test.sh` boots it with different RAM, which is the only real proof
+that the memory map comes from the machine rather than from a constant.
+
 ```
 the_rack: booting, mmu off
 the_rack: frame allocator up, building page tables
@@ -36,10 +40,6 @@ mmu: enabled, 4 KiB granule, 48 bit addresses
   ttbr1  : 0x00000000400a4000
   kernel : 0xffff000000000000 + physical
 
-memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
-  reserved : 0x0040000000..0x00400c1000   772 KiB  kernel image
-  free     : 0x00400c1000..0x0050000000   255 MiB  65333 frames
-
 device tree:
   address       : 0x0000000048000000 physical
   total size    : 1048576 bytes (0x100000)
@@ -47,11 +47,18 @@ device tree:
   struct block  : 0x40 + 0x1b88
   strings block : 0x1bc8 + 0x1ce
   boot cpu      : 0
-  reserved      : 256 frames
+  memory        : 256 MiB at 0x40000000, from the tree
+  frames        : the guess was right
+  reserved      : 256 frames, blob included
+
+memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
+  kernel   : 0x0040000000..0x00400ee000   952 KiB
+  reserved :    494 frames  1976 KiB  image and anything the machine claimed
+  free     :  65032 frames   254 MiB
 
 trap self test: resumed, registers intact
 lock self test: passed, guarded counter reached 1
-frame self test: passed, reuse of 0x400cb000 came back clean, 65077 frames free
+frame self test: passed, reuse of 0x400f8000 came back clean, 65032 frames free
 fdt self test: passed, a good header parses and ten broken ones are refused
 device tree self test: passed, this machine is a linux,dummy-virt with 256 MiB at 0x40000000
 paging self test: passed, running at 0xffff000040084a94
@@ -549,6 +556,64 @@ property that claims to be 64 KiB long, a node name with no NUL, eighteen
 levels of nesting against a walker that holds sixteen: each is a real read that
 would have gone somewhere it should not.
 
+**Why the device tree cannot be read before the MMU is on.** It would be
+convenient: the memory map is wanted before the frame allocator exists, and the
+allocator exists before paging does. The obstacle is not the blob, which sits
+at a physical address that works perfectly with the MMU off. It is that
+comparing a string calls `memcmp` with the address of a string literal, and the
+kernel is linked at its high half address, so that literal's address is a high
+one. Nothing translates it yet, the load takes a data abort, and the vector
+table is not installed at that point in boot, so the machine simply stops with
+no output at all.
+
+Nothing in Rust lets a function ask for its constants PC relatively. `adrp`
+happens where the compiler chooses, and the moment a `&str` is passed to
+something that was not inlined, its absolute address is what travels. So the
+boot path reads the header and only the header, which is ten `u32` at fixed
+offsets and needs no strings, and everything involving a name waits for the
+high half.
+
+Finding this took a QEMU exception trace: `-d int` showed a data abort with a
+`FAR` of `0xffff0000400ae1d0`, which is a high address in a kernel that had not
+enabled the MMU, and disassembling the faulting `ELR` landed inside `memcmp`.
+
+**Why the allocator starts on a guess.** Page tables come out of the frame
+allocator, the tree can only be read once the page tables exist, and the tree
+is what says how much memory there is. Something has to go first, so the
+allocator starts with `DEFAULT_RAM_SIZE`, which needs to be large enough to
+allocate page tables from and nothing more. Once the kernel is in the high half
+and the tree is readable, `frames::adopt` corrects it: growing means the frames
+past the guess stop being marked "does not exist", shrinking means they start
+being.
+
+The base address is not correctable the same way. It is baked into every page
+table already built and every frame already handed out, so a tree that
+disagrees about where RAM *starts* is refused rather than accommodated.
+
+**Why the physical map is extended before the allocator grows.** The order is
+load bearing: the kernel reaches a frame through the physical map, so a frame
+handed out above the guessed window before that window is extended faults on a
+kernel address that does not translate. The failure is quiet on a machine the
+size of the guess, because nothing ever allocates that high, which is why the
+frame self test writes to the last frame in RAM and reads it back.
+
+**Why the bitmap is sized for a maximum instead of for the machine.** Sizing it
+from the tree would mean allocating it, and the allocator is the thing being
+built. The escape is a fixed array big enough for 4 GiB, which costs 128 KiB of
+BSS, and marking every frame past the end of real memory as taken rather than
+bounds checking each allocation. The frames that do not exist have to look
+occupied, or the lowest-first search walks off the end of memory and hands out
+an address nothing answers to.
+
+Setting those bits one at a time was the first version, and it appeared to hang
+the machine on boot. Almost a million iterations, before the MMU is on, where
+every access is uncached Device memory. It fills whole words now.
+
+**Why the memory line is printed from the allocator and not from the tree.**
+The tree's number is only interesting once something acted on it. A line that
+reads back what was just parsed prints the same thing whether or not the
+allocator ever heard about it, which makes the boot log evidence of nothing.
+
 ## Layout
 
 ```
@@ -574,6 +639,7 @@ kernel/
     semihosting.rs asking QEMU to shut the machine down
 scripts/
   boot-test.sh    boots the kernel and fails if the banner never appears
+                  (MEMORY=512M boots it with a different amount of RAM)
   image.sh        turns the linked ELF into the flat image QEMU boots
   qemu-run.sh     what `cargo run` actually runs
 ```

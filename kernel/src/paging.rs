@@ -35,7 +35,7 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::frames::{self, FRAME_SIZE, Frame, RAM_BASE, RAM_SIZE};
+use crate::frames::{self, FRAME_SIZE, Frame};
 use crate::println;
 
 /// Base of the kernel's half of the address space.
@@ -290,13 +290,16 @@ fn build(root: Frame, offset: u64) {
     let data_start = symbol(unsafe { &__data_start });
     let kernel_end = symbol(unsafe { &__kernel_end });
 
-    // Everything below the kernel image: the device tree blob, and the gap
-    // QEMU leaves before our load address.
+    let ram_base = frames::ram_base();
+    let ram_size = frames::ram_size();
+
+    // Everything below the kernel image: the gap the boot protocol leaves
+    // before our load address, and whatever the firmware left in it.
     map_range(
         root,
-        RAM_BASE + offset,
-        RAM_BASE,
-        text_start - RAM_BASE,
+        ram_base + offset,
+        ram_base,
+        text_start - ram_base,
         Attributes::kernel_data(),
     );
 
@@ -330,7 +333,7 @@ fn build(root: Frame, offset: u64) {
         root,
         kernel_end + offset,
         kernel_end,
-        RAM_BASE + RAM_SIZE - kernel_end,
+        ram_base + ram_size - kernel_end,
         Attributes::kernel_data(),
     );
 
@@ -435,6 +438,70 @@ pub unsafe fn enable(ttbr0: Frame, ttbr1: Frame) {
             options(nostack),
         );
     }
+}
+
+/// Map a physical range into the kernel's half, in whichever table root.
+///
+/// Used while the MMU is still off, for memory the kernel has to be able to
+/// reach afterwards but which falls outside the range it guessed at.
+pub fn map_physical(root: Frame, pa: u64, size: u64) {
+    let start = pa / PAGE_SIZE * PAGE_SIZE;
+    let end = (pa + size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
+    map_range(
+        root,
+        start + KERNEL_BASE,
+        start,
+        end - start,
+        Attributes::kernel_data(),
+    );
+}
+
+/// The page table root the kernel's own half of memory is translated with.
+///
+/// Read back from the register rather than remembered in a static, because the
+/// register is the authority: it is what the hardware walks, and a static
+/// could disagree with it after a bug without anything noticing.
+pub fn kernel_root() -> Frame {
+    let ttbr1: u64;
+    unsafe { asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nomem, nostack)) };
+    Frame::from_addr(ttbr1 & ADDR_MASK)
+}
+
+/// Map more of RAM into the kernel's physical map.
+///
+/// The map is built before the device tree is readable, so it covers however
+/// much RAM the kernel guessed at. A machine with more than that has memory
+/// the frame allocator is about to start handing out and the kernel cannot
+/// reach, which surfaces as a fault the first time a page table or a task
+/// stack lands up there.
+pub fn extend_physical_map(from: u64, to: u64) {
+    if to <= from {
+        return;
+    }
+
+    map_range(
+        kernel_root(),
+        from + KERNEL_BASE,
+        from,
+        to - from,
+        Attributes::kernel_data(),
+    );
+
+    // Nothing was mapped here before, and this architecture does not cache
+    // failed translations, so strictly there is nothing stale to throw away.
+    // Done anyway: the cost is one boot time invalidation, and the cost of
+    // being wrong about it is a fault that only appears on machines with more
+    // memory than the one it was tested on.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
 }
 
 /// Move execution to the high half and continue at `continuation`, passing it
