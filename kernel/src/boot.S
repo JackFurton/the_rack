@@ -9,6 +9,13 @@
 .global _start
 
 _start:
+    // x0 holds the physical address of the device tree blob, and the very next
+    // instruction needs x0 for something else. This is the only moment it
+    // exists: save it somewhere the boot path does not touch, and hand it to
+    // Rust as an argument. A static would not do, because the BSS is zeroed a
+    // few lines below and would undo the store.
+    mov     x19, x0
+
     // QEMU starts every core at the same address. Only core 0 continues.
     mrs     x0, mpidr_el1
     and     x0, x0, #0xff
@@ -34,6 +41,8 @@ _start:
     b       .Lzero_bss
 .Lzero_done:
 
+    // AAPCS64: first argument in x0.
+    mov     x0, x19
     bl      kernel_main
 
     // kernel_main is `-> !`, so reaching here means something went very wrong.

@@ -18,6 +18,11 @@ jobs:
       - name: Install the bare metal target
         run: rustup target add aarch64-unknown-none-softfloat
 
+      # rust-objcopy, which scripts/image.sh uses to produce the flat binary
+      # QEMU boots. The host's own objcopy does not understand aarch64 objects.
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools
+
       - name: Install QEMU
         run: |
           sudo apt-get update

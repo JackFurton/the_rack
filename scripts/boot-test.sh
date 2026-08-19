@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 TARGET="${TARGET:-aarch64-unknown-none-softfloat}"
 PROFILE="${PROFILE:-debug}"
-KERNEL="target/$TARGET/$PROFILE/kernel"
+KERNEL="$(scripts/image.sh "target/$TARGET/$PROFILE/kernel")"
 TIMEOUT="${TIMEOUT:-10}"
 
 # Every string that must appear on the serial console for the boot to count.
@@ -30,6 +30,12 @@ EXPECTED=(
     "trap self test: resumed"
     "lock self test: passed"
     "frame self test: passed"
+    # The firmware's device tree pointer survived the reset vector, the jump to
+    # the high half, and its header checks. "version       : 17" rather than
+    # just "device tree:" because the failure path prints a line too, and the
+    # version only comes from a blob that was actually read.
+    "version       : 17"
+    "fdt self test: passed"
     # Proves the MMU is not merely on but actually restricting things: each of
     # these is an access that was refused and recovered from.
     "paging self test: passed"

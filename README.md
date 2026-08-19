@@ -37,12 +37,22 @@ mmu: enabled, 4 KiB granule, 48 bit addresses
   kernel : 0xffff000000000000 + physical
 
 memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
-  reserved : 0x0040000000..0x00400a3000   652 KiB  kernel image and DTB
-  free     : 0x00400a3000..0x0050000000   255 MiB  65363 frames
+  reserved : 0x0040000000..0x00400c1000   772 KiB  kernel image
+  free     : 0x00400c1000..0x0050000000   255 MiB  65333 frames
+
+device tree:
+  address       : 0x0000000048000000 physical
+  total size    : 1048576 bytes (0x100000)
+  version       : 17 (readable back to 16)
+  struct block  : 0x40 + 0x1b88
+  strings block : 0x1bc8 + 0x1ce
+  boot cpu      : 0
+  reserved      : 256 frames
 
 trap self test: resumed, registers intact
 lock self test: passed, guarded counter reached 1
-frame self test: passed, reuse of 0x400ad000 came back clean, 65363 frames free
+frame self test: passed, reuse of 0x400cb000 came back clean, 65077 frames free
+fdt self test: passed, a good header parses and ten broken ones are refused
 paging self test: passed, running at 0xffff000040084a94
   write to .text   : permission fault
   write to .rodata : permission fault
@@ -92,6 +102,7 @@ tier 3: synchronous IPC online.
 tier 3: leases online.
 tier 3: supervised restart online.
 tier 3: notifications online, heartbeat now runs at EL0.
+tier 4: the machine describes itself, device tree in hand.
 
 uptime 1s (100 ticks)
 uptime 2s (200 ticks)
@@ -159,9 +170,16 @@ context switch in tier 2 has to save and restore 512 bytes of vector state.
 Instead the kernel is compiled so it never emits an FP instruction. FP stays
 trapped and belongs to userspace.
 
-**Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000
-and QEMU puts the device tree blob at the base of it. Loading 512 KiB up leaves
-the DTB intact for tier 4.
+**Why the kernel loads at 0x4008_0000.** RAM on `virt` starts at 0x4000_0000,
+and 0x8_0000 above the base of RAM is where the Linux arm64 boot protocol says
+a flat kernel image goes. That is where QEMU loads one, so agreeing with it is
+what makes the flat image bootable at all.
+
+This was originally done for a different and wrong reason: the belief that QEMU
+drops the device tree at the base of RAM and that loading 512 KiB up leaves it
+alone. It does not. On `virt` the blob lands 128 MiB into RAM, well above the
+kernel image and squarely inside the frame allocator's pool, which is why the
+blob now has to be reserved explicitly once its size is known.
 
 **Why a task fault is judged by exception level, not address.** A fault from
 EL0 is the task's mistake and stops only that task; a fault at EL1 is a kernel
@@ -459,6 +477,43 @@ had ever taken that path, because refusing a reply needs a task that did not
 receive the message to try to answer it, which is exactly the case that had no
 test. Writing the test found the check worked and the code around it did not.
 
+**Why the kernel is booted as a flat image and not an ELF.** Handed an ELF,
+QEMU assumes a bare metal program and does the minimum: sets the program
+counter to the entry point, and nothing else. No device tree is built, and x0
+is zero. Handed a flat binary it follows the Linux arm64 boot protocol
+instead, which means it assembles a device tree describing the machine it just
+created and passes that blob's address in x0. The tree is not an optional extra
+QEMU offers on request; it exists only on the boot path that expects it. The
+same is true of real firmware at tier 8, which loads images and not ELFs.
+
+**Why the device tree pointer is an argument rather than a static.** It arrives
+in x0 at the reset vector and is destroyed one instruction later, because the
+first thing the boot code does is read `mpidr_el1` into the same register.
+Stashing it in a static is the obvious fix and is wrong twice: the BSS has not
+been zeroed yet, so the store is undone a few lines further down, and once the
+BSS *is* zeroed the MMU is still off, so the static is being written through an
+address that stops meaning that in a moment. Carrying it in a callee saved
+register and passing it as an argument, through the jump to the high half and
+all, avoids both. It is one `u64` and it costs nothing to hand along.
+
+**Why the device tree header is checked before it is believed.** The blob is
+the only input this kernel takes from outside itself, and it is a structure
+made almost entirely of offsets and lengths, at an address we were merely told
+about. Every field is a chance to read somewhere we should not: a `totalsize`
+of `u32::MAX`, a struct block that starts past the end, an offset near the top
+of the range whose bounds check passes only because the addition wrapped. On
+QEMU the blob is always well formed, which is exactly why the checking had to
+be written now. The first machine to hand us a bad one will not be the machine
+we are testing on, and the self test is ten headers built by hand to be wrong
+in ten specific ways.
+
+**Why a reservation checks the whole range before setting a bit.** `reserve_range`
+walks the range twice: once to find a frame that is already taken, and only
+then again to claim them. Setting bits as it goes would leave a caller that
+sees a failure, assumes nothing happened, and carries on, while part of the
+range has quietly left the pool for good. The leak would be invisible, because
+a reserved frame looks exactly like a frame in use.
+
 ## Layout
 
 ```
@@ -466,13 +521,14 @@ kernel/
   linker.ld       memory layout, load address, stack, BSS bounds
   build.rs        hands linker.ld to the linker
   src/
-    boot.S        reset vector: park secondary cores, set sp, zero BSS
+    boot.S        reset vector: keep the DTB pointer, park secondary cores, set sp, zero BSS
     vectors.S     the 16 entry exception vector table, save and restore
     main.rs       kernel_main, panic handler
     uart.rs       PL011 driver and the print!/println! macros
     exceptions.rs trap frame layout, ESR decoding, handler policy
     sync.rs       interrupt masking and the console lock
     frames.rs     physical frame allocator
+    fdt.rs        the device tree the firmware left us
     gic.rs        GICv2 distributor and CPU interface
     paging.rs     page tables, permissions, the move to the high half
     switch.S      the callee-saved swap that changes which task is running
@@ -483,4 +539,6 @@ kernel/
     semihosting.rs asking QEMU to shut the machine down
 scripts/
   boot-test.sh    boots the kernel and fails if the banner never appears
+  image.sh        turns the linked ELF into the flat image QEMU boots
+  qemu-run.sh     what `cargo run` actually runs
 ```
