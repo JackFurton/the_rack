@@ -599,6 +599,27 @@ impl Blob {
         Some((address, size))
     }
 
+    /// Every `reg` entry of a node, up to `out.len()`, and how many there were.
+    ///
+    /// Devices with more than one window are the normal case rather than the
+    /// exception: a GICv2 node carries the distributor and the CPU interface
+    /// as two entries, and taking only the first gives you a CPU interface
+    /// address that is really the distributor's, which then answers reads with
+    /// plausible nonsense.
+    pub fn regions(&self, node: &Node, out: &mut [Region]) -> usize {
+        let mut found = 0;
+
+        while found < out.len() {
+            let Some((base, size)) = self.reg(node, found) else {
+                break;
+            };
+            out[found] = Region { base, size };
+            found += 1;
+        }
+
+        found
+    }
+
     /// Find a node by path, for example `/` or `/memory` or `/soc/uart`.
     ///
     /// A component matches a node whose name is equal to it, or whose name is
@@ -669,6 +690,13 @@ impl Blob {
     pub fn find_compatible(&self, wanted: &str) -> Option<Node> {
         self.find_compatible_after(wanted, 0)
     }
+}
+
+/// One MMIO window from a node's `reg`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Region {
+    pub base: u64,
+    pub size: u64,
 }
 
 /// The properties of one node, in the order the blob stores them.

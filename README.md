@@ -50,6 +50,8 @@ device tree:
   memory        : 256 MiB at 0x40000000, from the tree
   frames        : the guess was right
   reserved      : 256 frames, blob included
+  console       : 0x0009000000 + 0x1000, where we were already talking
+  interrupts    : dist 0x0008000000 cpu 0x0008010000, as assumed
 
 memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
   kernel   : 0x0040000000..0x00400ee000   952 KiB
@@ -613,6 +615,25 @@ every access is uncached Device memory. It fills whole words now.
 The tree's number is only interesting once something acted on it. A line that
 reads back what was just parsed prints the same thing whether or not the
 allocator ever heard about it, which makes the boot log evidence of nothing.
+
+**Why the console is found second and used first.** The UART cannot wait to be
+discovered: it is how a failure gets reported, including the failure to find a
+UART. So it starts on a constant, the tree gets the last word, and a
+disagreement is printed rather than silently obeyed. The GIC could genuinely
+wait, since nothing needs an interrupt before the tree has been read, but it is
+brought up the same way so there is one story instead of two.
+
+**Why a `reg` with one entry is not enough.** A GICv2 node carries the
+distributor and the CPU interface as two entries of the same property. Reading
+only the first gives a CPU interface address that is really the distributor's,
+which is worse than a wrong address that faults: it is a device that answers,
+with plausible nonsense. The boot path asserts the two windows differ, which is
+the cheapest way to catch an index that never moved.
+
+**Why a discovered device inside the bootstrap window is left alone.** That
+window is mapped in 2 MiB blocks, and mapping a 4 KiB page inside one would
+walk into a block descriptor as though it were a table pointer. Devices found
+outside it, which is where the virtio transports live, get mapped properly.
 
 ## Layout
 

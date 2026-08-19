@@ -24,11 +24,36 @@
 //!   32..     SPI, shared peripheral, routed to a core of your choosing
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Distributor base on the QEMU `virt` machine.
-const GICD_BASE: usize = 0x0800_0000;
+/// Distributor base on the QEMU `virt` machine, until the device tree says
+/// otherwise. Unlike the UART this could wait to be discovered, since nothing
+/// needs an interrupt before the tree has been read, but starting both devices
+/// the same way keeps one story instead of two.
+const GICD_BOOTSTRAP: usize = 0x0800_0000;
 /// CPU interface base on the QEMU `virt` machine.
-const GICC_BASE: usize = 0x0801_0000;
+const GICC_BOOTSTRAP: usize = 0x0801_0000;
+
+static GICD: AtomicUsize = AtomicUsize::new(GICD_BOOTSTRAP);
+static GICC: AtomicUsize = AtomicUsize::new(GICC_BOOTSTRAP);
+
+/// Where the distributor and the CPU interface are.
+pub fn bases() -> (usize, usize) {
+    (GICD.load(Ordering::Relaxed), GICC.load(Ordering::Relaxed))
+}
+
+/// Where they are assumed to be before the tree is read.
+pub fn bootstrap_bases() -> (usize, usize) {
+    (GICD_BOOTSTRAP, GICC_BOOTSTRAP)
+}
+
+/// Take the addresses the device tree gave.
+///
+/// Must happen before `init`, which is the first thing to touch a register.
+pub fn adopt(distributor: usize, cpu_interface: usize) {
+    GICD.store(distributor, Ordering::Relaxed);
+    GICC.store(cpu_interface, Ordering::Relaxed);
+}
 
 // Distributor registers.
 const GICD_CTLR: usize = 0x000; // Control
@@ -66,23 +91,23 @@ fn reg(base: usize, offset: usize) -> usize {
 }
 
 unsafe fn gicd_read(offset: usize) -> u32 {
-    unsafe { read_volatile(reg(GICD_BASE, offset) as *const u32) }
+    unsafe { read_volatile(reg(GICD.load(Ordering::Relaxed), offset) as *const u32) }
 }
 
 unsafe fn gicd_write(offset: usize, value: u32) {
-    unsafe { write_volatile(reg(GICD_BASE, offset) as *mut u32, value) }
+    unsafe { write_volatile(reg(GICD.load(Ordering::Relaxed), offset) as *mut u32, value) }
 }
 
 unsafe fn gicd_write_byte(offset: usize, value: u8) {
-    unsafe { write_volatile(reg(GICD_BASE, offset) as *mut u8, value) }
+    unsafe { write_volatile(reg(GICD.load(Ordering::Relaxed), offset) as *mut u8, value) }
 }
 
 unsafe fn gicc_read(offset: usize) -> u32 {
-    unsafe { read_volatile(reg(GICC_BASE, offset) as *const u32) }
+    unsafe { read_volatile(reg(GICC.load(Ordering::Relaxed), offset) as *const u32) }
 }
 
 unsafe fn gicc_write(offset: usize, value: u32) {
-    unsafe { write_volatile(reg(GICC_BASE, offset) as *mut u32, value) }
+    unsafe { write_volatile(reg(GICC.load(Ordering::Relaxed), offset) as *mut u32, value) }
 }
 
 /// How many interrupt IDs this distributor implements.

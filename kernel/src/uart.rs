@@ -4,14 +4,49 @@
 //! Everything else we build gets debugged through this one device, so it is
 //! worth getting right rather than poking the data register and hoping.
 //!
-//! On the QEMU `virt` machine the first PL011 is mapped at 0x0900_0000.
+//! On the QEMU `virt` machine the first PL011 is mapped at 0x0900_0000, which
+//! is where this driver starts. Where it *is* comes from the device tree, but
+//! the tree cannot be read without a console to complain through, so the
+//! constant is the bootstrap and the tree gets the last word.
 
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::Lock;
 
-const PL011_BASE: usize = 0x0900_0000;
+/// Where to look for a PL011 before anything has said otherwise.
+///
+/// Chicken and egg: the UART is how a failure gets reported, so it cannot wait
+/// to be discovered. The honest arrangement is to start on the constant, find
+/// the real one later, and say so if they differ.
+const PL011_BOOTSTRAP: usize = 0x0900_0000;
+
+/// Where the console actually is. Read by `emergency_print`, which has no
+/// lock to reach through.
+static BASE: AtomicUsize = AtomicUsize::new(PL011_BOOTSTRAP);
+
+/// The address this driver is currently driving.
+pub fn base() -> usize {
+    BASE.load(Ordering::Relaxed)
+}
+
+/// The address it starts on, before the tree is read.
+pub fn bootstrap_base() -> usize {
+    PL011_BOOTSTRAP
+}
+
+/// Move the console to the address the device tree gave.
+///
+/// Re-initialises, because a different PL011 has not been configured yet. On
+/// `virt` this is the same address it started on, which makes the whole call a
+/// no-op and the comparison the interesting part.
+pub fn adopt(base: usize) {
+    BASE.store(base, Ordering::Relaxed);
+    let mut console = CONSOLE.lock();
+    console.base = base;
+    console.init();
+}
 
 // Register offsets from the PL011 technical reference manual.
 const DR: usize = 0x00; // Data
@@ -123,7 +158,7 @@ impl fmt::Write for Uart {
 /// and an interrupt landing partway through would splice its own output into
 /// the middle of the line. Garbled output during interrupt bring-up is worse
 /// than no output: it makes you distrust the one instrument you have.
-static CONSOLE: Lock<Uart> = Lock::new(unsafe { Uart::new(PL011_BASE) });
+static CONSOLE: Lock<Uart> = Lock::new(unsafe { Uart::new(PL011_BOOTSTRAP) });
 
 pub fn init() {
     CONSOLE.lock().init();
@@ -148,9 +183,9 @@ pub fn emergency_print(message: &str) {
     for byte in message.bytes() {
         unsafe {
             if byte == b'\n' {
-                raw_put(PL011_BASE, b'\r');
+                raw_put(base(), b'\r');
             }
-            raw_put(PL011_BASE, byte);
+            raw_put(base(), byte);
         }
     }
 }

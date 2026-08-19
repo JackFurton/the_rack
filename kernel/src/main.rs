@@ -132,6 +132,7 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
         Ok(blob) => {
             fdt::print_info(&blob);
             adopt_memory_map(&blob);
+            discover_devices(&blob);
         }
         Err(error) => {
             println!(
@@ -292,6 +293,76 @@ fn adopt_memory_map(blob: &fdt::Blob) {
     );
 
     println!("  reserved      : {reserved} frames, blob included");
+}
+
+/// Find the console and the interrupt controller in the tree.
+///
+/// Both are already running on constants by the time this happens, which is
+/// not a shortcut but the only possible order: the console has to work before
+/// anything can report that the console could not be found. So the constants
+/// are the bootstrap, the tree is the authority, and a disagreement is
+/// something the boot log says out loud rather than something that silently
+/// leaves the kernel talking to the wrong address.
+fn discover_devices(blob: &fdt::Blob) {
+    let mut windows = [fdt::Region::default(); 4];
+
+    match blob.find_compatible("arm,pl011") {
+        Some(node) => {
+            let found = blob.regions(&node, &mut windows);
+            assert!(found >= 1, "the pl011 node has no reg");
+            let uart = windows[0];
+
+            paging::map_device(uart.base, uart.size);
+            uart::adopt(uart.base as usize);
+
+            // Printed from the driver rather than from the tree, so the line
+            // is evidence that the address was taken and not merely read.
+            println!(
+                "  console       : {:#012x} + {:#x}{}",
+                uart::base(),
+                uart.size,
+                if uart.base as usize == uart::bootstrap_base() {
+                    ", where we were already talking"
+                } else {
+                    ", moved"
+                }
+            );
+        }
+        None => println!("  WARNING       : no pl011 in the tree, staying on the constant"),
+    }
+
+    match blob.find_compatible("arm,cortex-a15-gic") {
+        Some(node) => {
+            let found = blob.regions(&node, &mut windows);
+            assert!(
+                found >= 2,
+                "the gic node needs two reg entries: distributor and cpu interface"
+            );
+
+            let (distributor, cpu) = (windows[0], windows[1]);
+            assert_ne!(
+                distributor.base, cpu.base,
+                "distributor and cpu interface cannot be the same window"
+            );
+
+            paging::map_device(distributor.base, distributor.size);
+            paging::map_device(cpu.base, cpu.size);
+            gic::adopt(distributor.base as usize, cpu.base as usize);
+
+            let (boot_distributor, boot_cpu) = gic::bootstrap_bases();
+            let agreed =
+                distributor.base as usize == boot_distributor && cpu.base as usize == boot_cpu;
+
+            let (live_distributor, live_cpu) = gic::bases();
+            println!(
+                "  interrupts    : dist {:#012x} cpu {:#012x}{}",
+                live_distributor,
+                live_cpu,
+                if agreed { ", as assumed" } else { ", moved" }
+            );
+        }
+        None => println!("  WARNING       : no gic in the tree, staying on the constants"),
+    }
 }
 
 /// Which privilege level did the firmware drop us into?
