@@ -53,7 +53,8 @@ device tree:
   console       : 0x0009000000 + 0x1000, where we were already talking
   interrupts    : dist 0x0008000000 cpu 0x0008010000, as assumed
 
-virtio: 32 mmio slots, 1 occupied
+virtio: 32 mmio slots, 2 occupied
+  0x000a003c00 : entropy device, intid 78, offers 0x10130000000
   0x000a003e00 : block device, intid 79, offers 0x10130006e54
 
 memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
@@ -66,7 +67,8 @@ lock self test: passed, guarded counter reached 1
 frame self test: passed, reuse of 0x400f8000 came back clean, 65032 frames free
 fdt self test: passed, a good header parses and ten broken ones are refused
 device tree self test: passed, this machine is a linux,dummy-virt with 256 MiB at 0x40000000
-virtio self test: passed, 1 device agreed on features and was reset
+virtio self test: passed, 2 devices agreed on features and were reset
+virtqueue self test: passed, 16 bytes arrived by DMA, 16 of them not zero
 paging self test: passed, running at 0xffff000040084a94
   write to .text   : permission fault
   write to .rodata : permission fault
@@ -668,6 +670,37 @@ machine defaults to legacy for compatibility, so the runner passes
 `-global virtio-mmio.force-legacy=false` and the kernel refuses anything that
 still reports version 1.
 
+**Why every address in a virtqueue is physical.** The device does not walk our
+page tables. It has no idea the kernel lives in the high half, or that a task's
+memory is remapped per address space. Every address handed to it, including the
+addresses of the rings themselves, is a physical address, and every address the
+kernel uses to touch that same memory goes through the physical map instead.
+Getting it backwards does not fault, which is what makes it worth a test: the
+device cheerfully DMAs to whatever address it was given and reports success.
+Handing it a high half pointer produces `the device reported 16 bytes and wrote
+none`, with the bytes sitting wherever that number happened to point.
+
+**Why the queue is tested against an entropy device.** It is the simplest thing
+in the specification: one buffer in, random bytes out, no header to build and
+no status byte to interpret. Anything that goes wrong is the ring's fault,
+which is what makes it a test of the ring rather than of a driver. The disk
+comes later, with a request format of its own.
+
+**Why `DRIVER_OK` comes after the queues and not before.** The device may start
+using a queue the moment that bit is set, so a driver that sets it early is
+inviting the device to read a ring that is not finished. Setting it late costs
+nothing; QEMU simply ignores the notification until the bit appears, which is
+what the missing-`DRIVER_OK` break looks like: `the device never answered`.
+
+**Why the barriers cannot be shown to work here.** The descriptors must be
+visible before the index that publishes them, and the index before the
+notification. The barriers for that are written, and removing them changes
+nothing observable under QEMU: the device only looks when it is notified, and
+the emulated memory is coherent with the guest's. They are there for the
+machine where it does matter, and this boot log is not evidence about them.
+Cache maintenance is absent for a related but different reason: the transports
+are marked `dma-coherent`, so the device sees what the caches see.
+
 ## Layout
 
 ```
@@ -688,6 +721,7 @@ kernel/
     switch.S      the callee-saved swap that changes which task is running
     tasks.rs      kernel tasks, scheduling, address spaces, EL0 entry
     virtio.rs     virtio-mmio transports: discovery and the feature handshake
+    virtqueue.rs  the split virtqueue: descriptors, available and used rings
     syscall.rs    the SVC interface and its argument checking
     user.S        the program that runs at EL0
     timer.rs      generic timer, the 100 Hz heartbeat

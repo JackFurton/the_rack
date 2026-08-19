@@ -24,4 +24,5 @@ exec qemu-system-aarch64 \
     -global virtio-mmio.force-legacy=false \
     -drive "if=none,file=$DISK,format=raw,id=hd0" \
     -device virtio-blk-device,drive=hd0 \
+    -device virtio-rng-device \
     -kernel "$BIN"

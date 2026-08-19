@@ -19,6 +19,7 @@ pub mod tasks;
 pub mod timer;
 pub mod uart;
 pub mod virtio;
+pub mod virtqueue;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -154,6 +155,7 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
     fdt::self_test();
     fdt::tree_self_test();
     virtio::self_test();
+    virtqueue::self_test();
     sync::self_test();
     frames::self_test();
     paging::self_test();

@@ -42,6 +42,8 @@ const DEVICE_FEATURES: usize = 0x010;
 const DEVICE_FEATURES_SEL: usize = 0x014;
 const DRIVER_FEATURES: usize = 0x020;
 const DRIVER_FEATURES_SEL: usize = 0x024;
+const INTERRUPT_STATUS: usize = 0x060;
+const INTERRUPT_ACK: usize = 0x064;
 const STATUS: usize = 0x070;
 
 // Status bits. The device watches these being set in order, and a driver that
@@ -49,12 +51,21 @@ const STATUS: usize = 0x070;
 const STATUS_ACKNOWLEDGE: u32 = 1;
 const STATUS_DRIVER: u32 = 2;
 const STATUS_FEATURES_OK: u32 = 8;
+const STATUS_DRIVER_OK: u32 = 4;
 const STATUS_FAILED: u32 = 128;
 
 /// Feature bit 32: the device speaks the non-legacy specification. Required of
 /// anything answering on a version 2 transport, and the one bit this kernel
 /// insists on before it will talk to a device at all.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+/// Device id of a virtio entropy source. The simplest device in the
+/// specification: no headers, no status byte, hand it a buffer and it fills
+/// it, which makes it the right thing to test a queue against.
+pub const DEVICE_ENTROPY: u32 = 4;
+
+/// Device id of a virtio block device.
+pub const DEVICE_BLOCK: u32 = 2;
 
 /// Device ids we can put a name to. There are dozens more.
 fn device_name(id: u32) -> &'static str {
@@ -96,12 +107,18 @@ pub struct Transport {
 }
 
 impl Transport {
-    fn read(&self, offset: usize) -> u32 {
+    /// Read one transport register.
+    ///
+    /// Public because the queue code sets up registers in this same window,
+    /// and splitting them across two modules is the natural division: this one
+    /// is the device, that one is the ring.
+    pub fn read(&self, offset: usize) -> u32 {
         let address = paging::phys_to_virt((self.base + offset) as u64) as *const u32;
         unsafe { read_volatile(address) }
     }
 
-    fn write(&self, offset: usize, value: u32) {
+    /// Write one transport register.
+    pub fn write(&self, offset: usize, value: u32) {
         let address = paging::phys_to_virt((self.base + offset) as u64) as *mut u32;
         unsafe { write_volatile(address, value) }
     }
@@ -172,6 +189,31 @@ impl Transport {
         }
 
         Ok(agreed)
+    }
+
+    /// Tell the device the driver is ready to use it.
+    ///
+    /// Last step of bring-up, and it comes *after* the queues are configured,
+    /// not before. The device is entitled to start using a queue the moment
+    /// this is set, so a driver that sets it early is inviting the device to
+    /// read a ring that is not finished.
+    pub fn set_driver_ok(&self) {
+        let status = self.read(STATUS);
+        self.write(STATUS, status | STATUS_DRIVER_OK);
+    }
+
+    /// Acknowledge whatever the device is interrupting about.
+    ///
+    /// Reading the status tells you why (a queue moved, or the configuration
+    /// changed) and writing the same bits back clears it. Until that happens
+    /// the device keeps the interrupt line asserted, which is how a driver
+    /// that forgets turns one interrupt into an infinite storm.
+    pub fn ack_interrupt(&self) -> u32 {
+        let status = self.read(INTERRUPT_STATUS);
+        if status != 0 {
+            self.write(INTERRUPT_ACK, status);
+        }
+        status
     }
 
     /// The current status register, for anything that wants to check on a
