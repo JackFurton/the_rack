@@ -58,9 +58,12 @@ EXPECTED=(
     # A virtio transport, found in the tree, mapped, and talked to. The runner
     # attaches exactly one device, so "1 occupied" out of 32 slots is the whole
     # statement: the empty slots were seen and correctly ignored.
-    "virtio: 32 mmio slots, 1 occupied"
+    "virtio: 32 mmio slots, 2 occupied"
     "block device, intid 79"
     "virtio self test: passed"
+    # A buffer handed to a real device by physical address, filled by DMA, and
+    # returned through the used ring. Nothing here is emulated by the kernel.
+    "virtqueue self test: passed"
     # The parser walked the tree QEMU built and agreed with the frame allocator
     # about where RAM is. It is checked against handcrafted trees too, but this
     # line only appears when the live one was read.
@@ -225,6 +228,7 @@ trap cleanup EXIT INT TERM
         -global virtio-mmio.force-legacy=false \
     -drive "if=none,file=$DISK,format=raw,id=hd0" \
         -device virtio-blk-device,drive=hd0 \
+        -device virtio-rng-device \
         -kernel "$KERNEL" 2>"$WORK/qemu.stderr" &
     qemu_pid=$!
     echo "$qemu_pid" >"$PID_FILE"
