@@ -36,6 +36,10 @@ EXPECTED=(
     # version only comes from a blob that was actually read.
     "version       : 17"
     "fdt self test: passed"
+    # The parser walked the tree QEMU built and agreed with the frame allocator
+    # about where RAM is. It is checked against handcrafted trees too, but this
+    # line only appears when the live one was read.
+    "device tree self test: passed, this machine is a linux,dummy-virt"
     # Proves the MMU is not merely on but actually restricting things: each of
     # these is an access that was refused and recovered from.
     "paging self test: passed"

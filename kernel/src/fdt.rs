@@ -261,6 +261,464 @@ pub fn print_info(blob: &Blob) {
     println!("  boot cpu      : {}", blob.header.boot_cpuid_phys);
 }
 
+// -------------------------------------------------------------------------
+// The structure block.
+//
+// A depth first serialisation of the tree, made of four byte tokens. A node
+// opens with FDT_BEGIN_NODE and its name, carries its properties, then its
+// children, then FDT_END_NODE. Everything is big endian and everything is four
+// byte aligned, including the strings that are not.
+//
+// The awkward part of the format is that a property's name is not stored with
+// it. It is an offset into a separate strings block, so reading one property
+// means two bounds checked reads in two different parts of the blob.
+// -------------------------------------------------------------------------
+
+const FDT_BEGIN_NODE: u32 = 0x1;
+const FDT_END_NODE: u32 = 0x2;
+const FDT_PROP: u32 = 0x3;
+const FDT_NOP: u32 = 0x4;
+const FDT_END: u32 = 0x9;
+
+/// How deep the walker will follow the tree.
+///
+/// A fixed array rather than a stack, because the walker is holding one entry
+/// per level and this kernel has no allocator to grow into. Real trees are
+/// four or five deep; sixteen is room to spare, and a blob that claims to be
+/// deeper is treated as malformed rather than allowed to write past the array.
+const MAX_DEPTH: usize = 16;
+
+/// What `#address-cells` and `#size-cells` mean when a node does not say.
+///
+/// These are the spec's defaults and they are not what `virt` uses, which is
+/// exactly why they must not be guessed. Inheriting the parent's values would
+/// also be wrong: the property is not inherited, it is defaulted.
+const DEFAULT_ADDRESS_CELLS: u32 = 2;
+const DEFAULT_SIZE_CELLS: u32 = 1;
+
+/// A node found in the tree.
+///
+/// `address_cells` and `size_cells` are the *parent's*, because that is what
+/// this node's `reg` is written in. A node's own `#address-cells` describes its
+/// children, never itself, and getting that backwards is the classic way to
+/// decode a `reg` into nonsense that happens to look plausible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Node {
+    /// Offset of the `FDT_BEGIN_NODE` token from the start of the blob.
+    pub offset: u32,
+    /// 1 for the root, 2 for its children, and so on.
+    pub depth: usize,
+    pub address_cells: u32,
+    pub size_cells: u32,
+}
+
+/// One thing the walker found.
+pub enum Step {
+    /// A node opened. The walker's depth is now this node's depth.
+    Node(Node, &'static str),
+    /// A property of whichever node is currently open.
+    Property(&'static str, &'static [u8]),
+}
+
+impl Blob {
+    /// Read a big endian `u32` at `offset`, if it is inside the blob.
+    fn u32_at(&self, offset: u32) -> Option<u32> {
+        if offset.checked_add(4)? > self.header.totalsize {
+            return None;
+        }
+        Some(unsafe { be32(self.va, offset) })
+    }
+
+    /// Borrow `len` bytes at `offset`, if they are inside the blob.
+    ///
+    /// The `'static` is honest: the blob is reserved out of the frame
+    /// allocator for the life of the machine, so nothing can take it back.
+    fn bytes_at(&self, offset: u32, len: u32) -> Option<&'static [u8]> {
+        if offset.checked_add(len)? > self.header.totalsize {
+            return None;
+        }
+        let ptr = (self.va + offset as u64) as *const u8;
+        Some(unsafe { core::slice::from_raw_parts(ptr, len as usize) })
+    }
+
+    /// Read a NUL terminated string at `offset`, refusing to run past `limit`.
+    ///
+    /// The limit is the point of this function. A string in a device tree is
+    /// terminated by a byte the blob supplies, which means a blob that forgets
+    /// the terminator is asking us to read until we find one somewhere else.
+    fn str_at(&self, offset: u32, limit: u32) -> Option<&'static str> {
+        let limit = limit.min(self.header.totalsize);
+        if offset >= limit {
+            return None;
+        }
+
+        let mut end = offset;
+        while end < limit {
+            if unsafe { ((self.va + end as u64) as *const u8).read() } == 0 {
+                let bytes = self.bytes_at(offset, end - offset)?;
+                return core::str::from_utf8(bytes).ok();
+            }
+            end += 1;
+        }
+        None
+    }
+
+    /// Resolve a property name, which lives in the strings block.
+    fn string(&self, name_offset: u32) -> Option<&'static str> {
+        let start = self.header.off_dt_strings.checked_add(name_offset)?;
+        let end = self
+            .header
+            .off_dt_strings
+            .checked_add(self.header.size_dt_strings)?;
+        if start >= end {
+            return None;
+        }
+        self.str_at(start, end)
+    }
+
+    /// Walk from the top of the structure block.
+    pub fn walk(&self) -> Walker {
+        Walker::at(self, self.header.off_dt_struct)
+    }
+
+    /// Every property of a node, in order.
+    pub fn properties(&self, node: &Node) -> Properties {
+        // A node's properties always come before its children, so they start
+        // immediately after the name and end at the first token that is not
+        // another property. The format guarantees the ordering, which is what
+        // makes this a straight run rather than a search.
+        let mut offset = node.offset + 4;
+        offset = match self.str_at(offset, self.header.totalsize) {
+            Some(name) => align4(offset + name.len() as u32 + 1),
+            None => u32::MAX,
+        };
+
+        Properties {
+            blob: *self,
+            offset,
+        }
+    }
+
+    /// One property of a node by name.
+    pub fn property(&self, node: &Node, name: &str) -> Option<&'static [u8]> {
+        self.properties(node)
+            .find(|(found, _)| *found == name)
+            .map(|(_, value)| value)
+    }
+
+    /// A property that is a single big endian `u32`.
+    pub fn property_u32(&self, node: &Node, name: &str) -> Option<u32> {
+        let value = self.property(node, name)?;
+        let bytes: [u8; 4] = value.get(..4)?.try_into().ok()?;
+        Some(u32::from_be_bytes(bytes))
+    }
+
+    /// A property that is a NUL terminated string.
+    pub fn property_str(&self, node: &Node, name: &str) -> Option<&'static str> {
+        let value = self.property(node, name)?;
+        let end = value.iter().position(|byte| *byte == 0)?;
+        core::str::from_utf8(&value[..end]).ok()
+    }
+
+    /// Entry `index` of a node's `reg`, as an address and a length.
+    ///
+    /// Decoded with the parent's cell counts, which is the whole reason `Node`
+    /// carries them. On `virt` they are 2 and 2, so a hardcoded pair of `u64`
+    /// reads would work here and break on the first machine that uses 1 and 1,
+    /// which is most 32 bit ones.
+    pub fn reg(&self, node: &Node, index: usize) -> Option<(u64, u64)> {
+        // More than two cells is a 128 bit address, which we could not hold
+        // and have no way to honour. Refusing beats truncating.
+        if node.address_cells > 2 || node.size_cells > 2 || node.address_cells == 0 {
+            return None;
+        }
+
+        let value = self.property(node, "reg")?;
+        let entry = ((node.address_cells + node.size_cells) * 4) as usize;
+        let start = index.checked_mul(entry)?;
+        let bytes = value.get(start..start.checked_add(entry)?)?;
+
+        let (address, rest) = take_cells(bytes, node.address_cells)?;
+        let (size, _) = take_cells(rest, node.size_cells)?;
+        Some((address, size))
+    }
+
+    /// Find a node by path, for example `/` or `/memory` or `/soc/uart`.
+    ///
+    /// A component matches a node whose name is equal to it, or whose name is
+    /// it followed by `@` and a unit address. That elision is what lets the
+    /// caller ask for `/memory` without knowing in advance that this machine
+    /// calls it `memory@40000000`.
+    pub fn find_node(&self, path: &str) -> Option<Node> {
+        let wanted = path.split('/').filter(|part| !part.is_empty()).count();
+
+        // `on_path[d]` answers "is the node currently open at depth d the one
+        // the path asked for". Depth 0 is outside the root and trivially true,
+        // which is what makes the root itself a normal case rather than one.
+        let mut on_path = [false; MAX_DEPTH];
+        on_path[0] = true;
+
+        let mut walker = self.walk();
+        while let Some(step) = walker.next() {
+            let Step::Node(node, name) = step else {
+                continue;
+            };
+
+            let matched = if node.depth == 1 {
+                // The root's name is empty, and every path starts there.
+                name.is_empty()
+            } else {
+                let component = path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .nth(node.depth - 2);
+                match component {
+                    Some(component) => on_path[node.depth - 1] && name_matches(name, component),
+                    None => false,
+                }
+            };
+
+            on_path[node.depth] = matched;
+
+            if matched && node.depth == wanted + 1 {
+                return Some(node);
+            }
+        }
+
+        None
+    }
+
+    /// The first node after `offset` whose `compatible` list contains `wanted`.
+    ///
+    /// Takes an offset rather than returning an iterator so a caller can ask
+    /// for the next one, which is how #44 will find 32 virtio transports
+    /// without the walker having to be borrowed across the loop.
+    pub fn find_compatible_after(&self, wanted: &str, offset: u32) -> Option<Node> {
+        let mut walker = self.walk();
+        while let Some(step) = walker.next() {
+            let Step::Node(node, _) = step else { continue };
+            if node.offset <= offset {
+                continue;
+            }
+            if let Some(list) = self.property(&node, "compatible")
+                && string_list_contains(list, wanted)
+            {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// The first node whose `compatible` list contains `wanted`.
+    pub fn find_compatible(&self, wanted: &str) -> Option<Node> {
+        self.find_compatible_after(wanted, 0)
+    }
+}
+
+/// The properties of one node, in the order the blob stores them.
+pub struct Properties {
+    blob: Blob,
+    offset: u32,
+}
+
+impl Iterator for Properties {
+    type Item = (&'static str, &'static [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let token = self.blob.u32_at(self.offset)?;
+
+            // A NOP is a token that was deleted in place by something that
+            // edited the blob without wanting to move everything after it.
+            if token == FDT_NOP {
+                self.offset += 4;
+                continue;
+            }
+
+            if token != FDT_PROP {
+                return None;
+            }
+
+            let len = self.blob.u32_at(self.offset + 4)?;
+            let name_offset = self.blob.u32_at(self.offset + 8)?;
+            let value = self.blob.bytes_at(self.offset + 12, len)?;
+            let name = self.blob.string(name_offset)?;
+
+            self.offset = align4(self.offset + 12 + len);
+            return Some((name, value));
+        }
+    }
+}
+
+/// A cursor over the structure block.
+///
+/// Holds the cell counts for every level currently open, because a node's
+/// `reg` is decoded with numbers that were declared by its parent, several
+/// tokens ago and possibly several levels up.
+pub struct Walker {
+    blob: Blob,
+    offset: u32,
+    end: u32,
+    depth: usize,
+    /// `cells[d]` is what the node open at depth `d` declared for its
+    /// children. `cells[0]` is the spec default, for the root itself.
+    cells: [(u32, u32); MAX_DEPTH],
+}
+
+impl Walker {
+    fn at(blob: &Blob, offset: u32) -> Self {
+        let end = blob
+            .header
+            .off_dt_struct
+            .saturating_add(blob.header.size_dt_struct);
+
+        Walker {
+            blob: *blob,
+            offset,
+            end,
+            depth: 0,
+            cells: [(DEFAULT_ADDRESS_CELLS, DEFAULT_SIZE_CELLS); MAX_DEPTH],
+        }
+    }
+
+    /// How deep the walk currently is. 0 is outside the root.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// The next node or property, or `None` at the end of the tree.
+    ///
+    /// `None` also covers every malformed case: a token that is not a token, a
+    /// length that runs off the end, a name with no terminator, a tree deeper
+    /// than the walker can hold. Stopping is the only safe answer to all of
+    /// them, and distinguishing "ended" from "gave up" would tempt a caller
+    /// into carrying on with half a tree.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Step> {
+        loop {
+            if self.offset >= self.end {
+                return None;
+            }
+
+            let token = self.blob.u32_at(self.offset)?;
+
+            match token {
+                FDT_NOP => self.offset += 4,
+
+                FDT_END => return None,
+
+                FDT_BEGIN_NODE => {
+                    let offset = self.offset;
+                    let name = self.blob.str_at(offset + 4, self.end)?;
+
+                    if self.depth + 1 >= MAX_DEPTH {
+                        return None;
+                    }
+
+                    self.depth += 1;
+                    let parent = self.cells[self.depth - 1];
+                    self.cells[self.depth] = (DEFAULT_ADDRESS_CELLS, DEFAULT_SIZE_CELLS);
+
+                    // Name, its NUL, then padding back to a four byte boundary.
+                    self.offset = align4(offset + 4 + name.len() as u32 + 1);
+
+                    return Some(Step::Node(
+                        Node {
+                            offset,
+                            depth: self.depth,
+                            address_cells: parent.0,
+                            size_cells: parent.1,
+                        },
+                        name,
+                    ));
+                }
+
+                FDT_END_NODE => {
+                    self.depth = self.depth.checked_sub(1)?;
+                    self.offset += 4;
+                }
+
+                FDT_PROP => {
+                    let len = self.blob.u32_at(self.offset + 4)?;
+                    let name_offset = self.blob.u32_at(self.offset + 8)?;
+                    let value = self.blob.bytes_at(self.offset + 12, len)?;
+                    let name = self.blob.string(name_offset)?;
+
+                    self.offset = align4(self.offset + 12 + len);
+
+                    // These two are what every `reg` in the subtree below is
+                    // read with, so they are recorded as they go past rather
+                    // than looked up later.
+                    if self.depth > 0
+                        && let Some(cells) = read_cells(value)
+                    {
+                        if name == "#address-cells" {
+                            self.cells[self.depth].0 = cells;
+                        } else if name == "#size-cells" {
+                            self.cells[self.depth].1 = cells;
+                        }
+                    }
+
+                    return Some(Step::Property(name, value));
+                }
+
+                // Not a token at all, which means we are no longer reading
+                // structure. Everything after this point is guesswork.
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Round up to the next four byte boundary, saturating rather than wrapping.
+fn align4(offset: u32) -> u32 {
+    offset.saturating_add(3) & !3
+}
+
+/// Read `count` big endian cells as one number, and return what is left.
+fn take_cells(bytes: &[u8], count: u32) -> Option<(u64, &[u8])> {
+    let mut value: u64 = 0;
+    let mut rest = bytes;
+
+    for _ in 0..count {
+        let (cell, tail) = rest.split_at_checked(4)?;
+        value = (value << 32) | u32::from_be_bytes(cell.try_into().ok()?) as u64;
+        rest = tail;
+    }
+
+    Some((value, rest))
+}
+
+/// A `#address-cells` or `#size-cells` value, if it is one.
+fn read_cells(value: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = value.get(..4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// Does this node name match this path component?
+///
+/// `memory@40000000` matches `memory`, because the part after `@` is the unit
+/// address and a caller asking for a path by name should not have to know it.
+fn name_matches(name: &str, component: &str) -> bool {
+    if name == component {
+        return true;
+    }
+    match name.split_once('@') {
+        Some((base, _)) => base == component,
+        None => false,
+    }
+}
+
+/// Is `wanted` one of the NUL separated strings in this property?
+///
+/// `compatible` is a list, most specific first, and matching it as one string
+/// would miss every device whose node names a specific model before the
+/// generic one it is compatible with.
+pub fn string_list_contains(list: &[u8], wanted: &str) -> bool {
+    list.split(|byte| *byte == 0)
+        .any(|entry| entry == wanted.as_bytes())
+}
+
 /// A device tree header built by hand, so the checks can be aimed at something
 /// deliberately broken.
 ///
@@ -369,4 +827,230 @@ pub fn self_test() {
     assert_eq!(init(0x1000).unwrap_err(), Error::OutsideRam(0x1000));
 
     println!("passed, a good header parses and ten broken ones are refused");
+}
+
+// -------------------------------------------------------------------------
+// Walking the tree, tested against trees built to be wrong.
+// -------------------------------------------------------------------------
+
+/// The strings block every handcrafted test tree shares. Property names are
+/// offsets into this, which is how the format stores them.
+const TEST_STRINGS: &[u8] = b"compatible\0reg\0#address-cells\0#size-cells\0";
+const STR_COMPATIBLE: u32 = 0;
+const STR_REG: u32 = 11;
+const STR_ADDRESS_CELLS: u32 = 15;
+const STR_SIZE_CELLS: u32 = 30;
+
+/// A device tree assembled a token at a time.
+///
+/// Building the malformed cases by hand is the only way to test them: QEMU
+/// will never hand us a truncated blob, and the day something does is the day
+/// this code is running somewhere it cannot be debugged.
+#[repr(align(8))]
+struct Tree {
+    bytes: [u8; 512],
+    len: usize,
+}
+
+impl Tree {
+    fn new() -> Self {
+        Tree {
+            bytes: [0; 512],
+            len: 40,
+        }
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes[self.len..self.len + 4].copy_from_slice(&value.to_be_bytes());
+        self.len += 4;
+    }
+
+    fn begin(&mut self, name: &str) {
+        self.u32(FDT_BEGIN_NODE);
+        self.bytes[self.len..self.len + name.len()].copy_from_slice(name.as_bytes());
+        self.len += name.len() + 1;
+        self.len = self.len.next_multiple_of(4);
+    }
+
+    fn end_node(&mut self) {
+        self.u32(FDT_END_NODE);
+    }
+
+    fn prop(&mut self, name_offset: u32, value: &[u8]) {
+        self.u32(FDT_PROP);
+        self.u32(value.len() as u32);
+        self.u32(name_offset);
+        self.bytes[self.len..self.len + value.len()].copy_from_slice(value);
+        self.len += value.len();
+        self.len = self.len.next_multiple_of(4);
+    }
+
+    fn cells(&mut self, address: u32, size: u32) {
+        self.prop(STR_ADDRESS_CELLS, &address.to_be_bytes());
+        self.prop(STR_SIZE_CELLS, &size.to_be_bytes());
+    }
+
+    /// A property whose declared length is a lie.
+    fn lying_prop(&mut self, name_offset: u32, claimed: u32) {
+        self.u32(FDT_PROP);
+        self.u32(claimed);
+        self.u32(name_offset);
+    }
+
+    /// Write the header and hand back a blob, checked exactly the way the
+    /// firmware's own would be.
+    fn finish(&mut self) -> Blob {
+        self.u32(FDT_END);
+
+        let struct_start = 40u32;
+        let struct_size = self.len as u32 - struct_start;
+        let strings_start = self.len as u32;
+        self.bytes[self.len..self.len + TEST_STRINGS.len()].copy_from_slice(TEST_STRINGS);
+        self.len += TEST_STRINGS.len();
+
+        let mut header = [0u32; 10];
+        header[0] = MAGIC;
+        header[1] = self.len as u32;
+        header[2] = struct_start;
+        header[3] = strings_start;
+        header[4] = struct_start;
+        header[5] = 17;
+        header[6] = 16;
+        header[7] = 0;
+        header[8] = TEST_STRINGS.len() as u32;
+        header[9] = struct_size;
+
+        for (index, field) in header.iter().enumerate() {
+            self.bytes[index * 4..index * 4 + 4].copy_from_slice(&field.to_be_bytes());
+        }
+
+        let va = self.bytes.as_ptr() as u64;
+        Blob {
+            pa: 0,
+            va,
+            header: unsafe { probe(va) }.expect("the test tree must pass the header checks"),
+        }
+    }
+}
+
+/// A tree with a root and one child, in whichever cell counts are asked for.
+fn test_tree(address_cells: u32, size_cells: u32) -> Tree {
+    let mut tree = Tree::new();
+    tree.begin("");
+    tree.cells(address_cells, size_cells);
+    tree.prop(STR_COMPATIBLE, b"test,root\0");
+    tree.begin("memory@1000");
+    tree.prop(STR_COMPATIBLE, b"test,memory\0test,thing\0");
+    tree.prop(
+        STR_REG,
+        &[
+            0, 0, 0, 0, 0, 0, 0x10, 0, // 0x1000 as two cells
+            0, 0, 0, 0, 0, 0, 0x20, 0, // 0x2000 as two cells
+        ],
+    );
+    tree.end_node();
+    tree.end_node();
+    tree
+}
+
+/// Walking, on trees built to be walked and on trees built to trip it.
+pub fn tree_self_test() {
+    print!("device tree self test: ");
+
+    // A path resolves, and its `reg` is decoded with the cells the parent
+    // declared.
+    let tree = test_tree(2, 2).finish();
+    let memory = tree.find_node("/memory").expect("no /memory node");
+    assert_eq!(memory.depth, 2);
+    assert_eq!(tree.reg(&memory, 0), Some((0x1000, 0x2000)));
+
+    // The unit address is elided by the caller and supplied by the tree. The
+    // full name still works.
+    assert_eq!(tree.find_node("/memory@1000"), Some(memory));
+
+    // The same 16 bytes read as one address cell and one size cell. If the
+    // cell counts were hardcoded to the pair `virt` happens to use, this would
+    // still say 0x1000 and 0x2000.
+    let narrow = test_tree(1, 1).finish();
+    let narrow_memory = narrow.find_node("/memory").expect("no /memory node");
+    assert_eq!(narrow.reg(&narrow_memory, 0), Some((0x0, 0x1000)));
+    assert_eq!(narrow.reg(&narrow_memory, 1), Some((0x0, 0x2000)));
+
+    // The root is a node like any other, and its own cells come from the
+    // default rather than from itself.
+    let root = tree.find_node("/").expect("no root node");
+    assert_eq!(root.depth, 1);
+    assert_eq!(tree.property_str(&root, "compatible"), Some("test,root"));
+
+    // `compatible` is a list. Matching the whole property as one string finds
+    // the first entry and misses every other one.
+    assert_eq!(tree.find_compatible("test,thing"), Some(memory));
+    assert_eq!(tree.find_compatible("test,memory"), Some(memory));
+    assert_eq!(tree.find_compatible("test,mem"), None);
+
+    // Absent things are absent, not faults.
+    assert_eq!(tree.find_node("/nowhere"), None);
+    assert_eq!(tree.find_node("/memory/deeper"), None);
+    assert_eq!(tree.property(&memory, "status"), None);
+    assert_eq!(tree.reg(&memory, 9), None);
+
+    // A property whose length runs past the end of the blob. Believed, this is
+    // a slice of 64 KiB of whatever follows the device tree.
+    let mut lying = Tree::new();
+    lying.begin("");
+    lying.lying_prop(STR_COMPATIBLE, 0x10000);
+    lying.end_node();
+    let lying = lying.finish();
+    let lying_root = lying.find_node("/").expect("no root node");
+    assert_eq!(lying.property(&lying_root, "compatible"), None);
+
+    // A node name with no terminator, which asks us to read until we find a
+    // zero byte somewhere outside the blob.
+    let mut unterminated = Tree::new();
+    unterminated.u32(FDT_BEGIN_NODE);
+    unterminated.bytes[unterminated.len..unterminated.len + 4].copy_from_slice(b"aaaa");
+    unterminated.len += 4;
+    let unterminated = unterminated.finish();
+    assert_eq!(unterminated.find_node("/"), None);
+
+    // A tree deeper than the walker can hold. The array of cell counts is
+    // fixed, so the alternative to stopping is writing past the end of it.
+    let mut deep = Tree::new();
+    for _ in 0..MAX_DEPTH + 2 {
+        deep.begin("");
+    }
+    let deep = deep.finish();
+    let mut walker = deep.walk();
+    let mut seen = 0;
+    while walker.next().is_some() {
+        seen += 1;
+    }
+    assert_eq!(
+        seen,
+        MAX_DEPTH - 1,
+        "the walker descended past its own array"
+    );
+
+    // And the real thing: what QEMU actually handed us this boot.
+    if let Some(live) = blob() {
+        let root = live.find_node("/").expect("the live tree has no root");
+        let model = live.property_str(&root, "compatible").unwrap_or("?");
+        let memory = live
+            .find_node("/memory")
+            .expect("the live tree has no memory");
+        let (base, size) = live.reg(&memory, 0).expect("no reg on /memory");
+
+        assert_eq!(base, RAM_BASE, "the tree disagrees about where RAM starts");
+        assert_eq!(
+            size, RAM_SIZE,
+            "the tree disagrees about how much RAM there is"
+        );
+
+        println!(
+            "passed, this machine is a {model} with {} MiB at {base:#x}",
+            size / 1024 / 1024
+        );
+    } else {
+        println!("passed, no live tree to check against");
+    }
 }

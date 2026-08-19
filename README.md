@@ -53,6 +53,7 @@ trap self test: resumed, registers intact
 lock self test: passed, guarded counter reached 1
 frame self test: passed, reuse of 0x400cb000 came back clean, 65077 frames free
 fdt self test: passed, a good header parses and ten broken ones are refused
+device tree self test: passed, this machine is a linux,dummy-virt with 256 MiB at 0x40000000
 paging self test: passed, running at 0xffff000040084a94
   write to .text   : permission fault
   write to .rodata : permission fault
@@ -514,6 +515,40 @@ sees a failure, assumes nothing happened, and carries on, while part of the
 range has quietly left the pool for good. The leak would be invisible, because
 a reserved frame looks exactly like a frame in use.
 
+**Why `reg` is decoded with the parent's cell counts.** `#address-cells` and
+`#size-cells` describe a node's *children*, never the node itself, so a `reg`
+is read with numbers declared one level up. On `virt` both are 2, which means
+reading every `reg` as a pair of `u64` works perfectly and would keep working
+until the first machine that uses 1 and 1, which is most 32 bit ones. The
+walker therefore carries a cell count per open level, because by the time a
+`reg` is decoded its parent's declaration is several tokens and possibly
+several levels behind.
+
+The defaults are their own trap. When a node does not say, the spec's answer is
+2 address cells and 1 size cell, and it is a default rather than an
+inheritance: a child of a node that declared 2 and 2 does not get 2 and 2, it
+gets 2 and 1.
+
+**Why `compatible` is a list and not a string.** A node names the specific
+device first and the generic thing it behaves like afterwards, NUL separated,
+most specific first. Comparing the property against one string finds the first
+entry and misses every other one, which means a driver matching on the generic
+name never matches any device that also names its model. The whole point of the
+property is the fallback.
+
+**Why every malformed tree ends the walk rather than reporting how.** The blob
+is offsets and lengths all the way down, and the failures are not
+distinguishable in any useful way: a token that is not a token, a length that
+runs off the end, a name with no terminator, and a tree deeper than the walker
+can hold all mean the same thing, which is that we are no longer reading
+structure. Returning a reason would tempt a caller into carrying on with half a
+tree. Stopping is the only answer that is safe for all of them.
+
+The test builds those trees by hand, because QEMU will never hand us one. A
+property that claims to be 64 KiB long, a node name with no NUL, eighteen
+levels of nesting against a walker that holds sixteen: each is a real read that
+would have gone somewhere it should not.
+
 ## Layout
 
 ```
@@ -528,7 +563,7 @@ kernel/
     exceptions.rs trap frame layout, ESR decoding, handler policy
     sync.rs       interrupt masking and the console lock
     frames.rs     physical frame allocator
-    fdt.rs        the device tree the firmware left us
+    fdt.rs        the device tree the firmware left us: header, walker, lookups
     gic.rs        GICv2 distributor and CPU interface
     paging.rs     page tables, permissions, the move to the high half
     switch.S      the callee-saved swap that changes which task is running

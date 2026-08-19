@@ -120,6 +120,7 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
 
     exceptions::self_test();
     fdt::self_test();
+    fdt::tree_self_test();
     sync::self_test();
     frames::self_test();
     paging::self_test();
