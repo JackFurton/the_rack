@@ -55,6 +55,12 @@ EXPECTED=(
     # the part that would not survive a wrong address.
     "console       : 0x0009000000 + 0x1000, where we were already talking"
     "interrupts    : dist 0x0008000000 cpu 0x0008010000, as assumed"
+    # A virtio transport, found in the tree, mapped, and talked to. The runner
+    # attaches exactly one device, so "1 occupied" out of 32 slots is the whole
+    # statement: the empty slots were seen and correctly ignored.
+    "virtio: 32 mmio slots, 1 occupied"
+    "block device, intid 79"
+    "virtio self test: passed"
     # The parser walked the tree QEMU built and agreed with the frame allocator
     # about where RAM is. It is checked against handcrafted trees too, but this
     # line only appears when the live one was read.
@@ -186,6 +192,19 @@ cleanup() {
     fi
     rm -rf "$WORK"
 }
+# A disk for the virtio block transport to be attached to. Contents are a
+# recognisable pattern rather than zeroes, so a driver that reads a sector and
+# gets nothing can tell "read the wrong place" from "read nothing at all".
+DISK="$WORK/disk.img"
+python3 - "$DISK" <<'PYTHON'
+import sys
+
+sectors = 64
+with open(sys.argv[1], "wb") as disk:
+    for sector in range(sectors):
+        disk.write(bytes([sector & 0xff]) * 512)
+PYTHON
+
 trap cleanup EXIT INT TERM
 
 # QEMU runs inside a subshell so its exit code can be recorded, which is how we
@@ -203,6 +222,9 @@ trap cleanup EXIT INT TERM
         -display none \
         -serial "file:$LOG" \
         -semihosting-config enable=on,target=native \
+        -global virtio-mmio.force-legacy=false \
+    -drive "if=none,file=$DISK,format=raw,id=hd0" \
+        -device virtio-blk-device,drive=hd0 \
         -kernel "$KERNEL" 2>"$WORK/qemu.stderr" &
     qemu_pid=$!
     echo "$qemu_pid" >"$PID_FILE"
