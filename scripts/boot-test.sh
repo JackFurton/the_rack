@@ -18,6 +18,16 @@ PROFILE="${PROFILE:-debug}"
 KERNEL="$(scripts/image.sh "target/$TARGET/$PROFILE/kernel")"
 TIMEOUT="${TIMEOUT:-10}"
 
+# How much RAM to give the guest. Worth varying: the kernel boots on a guess
+# and then takes the real number from the device tree, so a run at a size it
+# was never compiled against is the only thing that proves the discovery works.
+MEMORY="${MEMORY:-256M}"
+case "$MEMORY" in
+    *G) MEMORY_MIB=$(( ${MEMORY%G} * 1024 )) ;;
+    *M) MEMORY_MIB="${MEMORY%M}" ;;
+    *)  MEMORY_MIB="$MEMORY" ;;
+esac
+
 # Every string that must appear on the serial console for the boot to count.
 EXPECTED=(
     "the_rack"
@@ -36,6 +46,9 @@ EXPECTED=(
     # version only comes from a blob that was actually read.
     "version       : 17"
     "fdt self test: passed"
+    # Discovery, not a constant: this line is built from whatever -m the runner
+    # was given, so a kernel that ignored the tree fails here at any other size.
+    "memory        : $MEMORY_MIB MiB at 0x40000000, from the tree"
     # The parser walked the tree QEMU built and agreed with the frame allocator
     # about where RAM is. It is checked against handcrafted trees too, but this
     # line only appears when the live one was read.
@@ -180,7 +193,7 @@ trap cleanup EXIT INT TERM
     qemu-system-aarch64 \
         -machine virt \
         -cpu cortex-a72 \
-        -m 256M \
+        -m "$MEMORY" \
         -display none \
         -serial "file:$LOG" \
         -semihosting-config enable=on,target=native \

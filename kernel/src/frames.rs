@@ -24,25 +24,66 @@
 //! reuse is reproducible and therefore testable. A smarter allocator can go in
 //! later when something actually needs it.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::sync::Lock;
 use crate::{print, println};
 
-/// Physical address where RAM starts on the QEMU `virt` machine.
-pub const RAM_BASE: u64 = 0x4000_0000;
+/// Where RAM starts if nothing tells us otherwise. True of the QEMU `virt`
+/// machine, and the only guess available when there is no device tree.
+pub const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
 
-/// How much RAM we assume. Matches the `-m 256M` in the QEMU runner.
-///
-/// Hardcoded on purpose for now. Real discovery means parsing the device tree
-/// blob QEMU leaves at `RAM_BASE`, which is tier 4 work. Until then this is a
-/// number that must be kept in step with the runner, so the boot banner prints
-/// it where a mismatch would be noticed.
-pub const RAM_SIZE: u64 = 256 * 1024 * 1024;
+/// How much RAM to assume when nothing tells us otherwise.
+pub const DEFAULT_RAM_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Standard 4 KiB page. Also the granule the MMU will use in #5.
+/// Standard 4 KiB page. Also the granule the MMU uses.
 pub const FRAME_SIZE: u64 = 4096;
 
-const FRAME_COUNT: usize = (RAM_SIZE / FRAME_SIZE) as usize;
-const BITMAP_WORDS: usize = FRAME_COUNT / 64;
+/// The most RAM this kernel can track.
+///
+/// The bitmap is a fixed array, so something has to bound it. A kernel with an
+/// allocator would size the bitmap from what the device tree reported and
+/// place it in the memory it describes; this one has no allocator until the
+/// bitmap exists, which is the loop that makes bootstrapping allocators
+/// awkward. 4 GiB of tracking costs 128 KiB of BSS, which is a fair price for
+/// not having to solve that yet. RAM past this point is ignored, loudly.
+pub const MAX_RAM: u64 = 4 * 1024 * 1024 * 1024;
+
+const MAX_FRAMES: usize = (MAX_RAM / FRAME_SIZE) as usize;
+const BITMAP_WORDS: usize = MAX_FRAMES / 64;
+
+/// Where RAM is, as discovered at boot.
+///
+/// Plain atomics rather than a `Lock`, because these are read on the
+/// allocation path and written once, before there is anything to race with.
+/// Relaxed loads and stores of a `u64` are ordinary `ldr` and `str` on this
+/// architecture, which also makes them safe to touch before the MMU is on,
+/// where an exclusive access would be on questionable ground.
+static RAM_BASE_ADDR: AtomicU64 = AtomicU64::new(DEFAULT_RAM_BASE);
+static RAM_LENGTH: AtomicU64 = AtomicU64::new(DEFAULT_RAM_SIZE);
+
+/// First address past the kernel image, remembered rather than recomputed.
+///
+/// The reserved frames used to be exactly the kernel image, so the boundary
+/// could be derived from a count. Reservations are scattered now (the device
+/// tree is 128 MiB up on this machine), and deriving a boundary from a count
+/// draws a picture of memory that is not the one the bitmap holds.
+static IMAGE_END: AtomicU64 = AtomicU64::new(0);
+
+/// Physical address where RAM starts.
+pub fn ram_base() -> u64 {
+    RAM_BASE_ADDR.load(Ordering::Relaxed)
+}
+
+/// How much RAM there is, as the machine described it.
+pub fn ram_size() -> u64 {
+    RAM_LENGTH.load(Ordering::Relaxed)
+}
+
+/// How many frames that works out to.
+pub fn frame_count() -> usize {
+    (ram_size() / FRAME_SIZE) as usize
+}
 
 unsafe extern "C" {
     /// First byte past the kernel image, including its stack. From `linker.ld`.
@@ -74,11 +115,11 @@ impl Frame {
 
     /// Index of this frame within RAM.
     fn index(&self) -> usize {
-        ((self.0 - RAM_BASE) / FRAME_SIZE) as usize
+        ((self.0 - ram_base()) / FRAME_SIZE) as usize
     }
 
     fn from_index(index: usize) -> Self {
-        Frame(RAM_BASE + index as u64 * FRAME_SIZE)
+        Frame(ram_base() + index as u64 * FRAME_SIZE)
     }
 
     /// Wrap a physical address that is already known to name a frame.
@@ -122,6 +163,50 @@ impl Bitmap {
         self.bits[index / 64] |= 1 << (index % 64);
     }
 
+    /// Mark every frame in `range` taken, a word at a time.
+    ///
+    /// Bit by bit would be correct and unusably slow in the one place this is
+    /// needed: `init` runs with the MMU off, where every access is
+    /// uncached device memory, and the tail of an unpopulated bitmap is close
+    /// to a million frames. A machine that appeared to hang on boot turned out
+    /// to be that loop.
+    fn set_range(&mut self, range: core::ops::Range<usize>) {
+        for index in range.clone().take_while(|index| !index.is_multiple_of(64)) {
+            self.set(index);
+        }
+
+        let first_whole_word = range.start.next_multiple_of(64);
+        if first_whole_word >= range.end {
+            return;
+        }
+
+        let words = first_whole_word / 64..range.end / 64;
+        self.bits[words].fill(u64::MAX);
+
+        for index in range.end / 64 * 64..range.end {
+            self.set(index);
+        }
+    }
+
+    /// The inverse of `set_range`, and word wise for the same reason.
+    fn clear_range(&mut self, range: core::ops::Range<usize>) {
+        for index in range.clone().take_while(|index| !index.is_multiple_of(64)) {
+            self.clear(index);
+        }
+
+        let first_whole_word = range.start.next_multiple_of(64);
+        if first_whole_word >= range.end {
+            return;
+        }
+
+        let words = first_whole_word / 64..range.end / 64;
+        self.bits[words].fill(0);
+
+        for index in range.end / 64 * 64..range.end {
+            self.clear(index);
+        }
+    }
+
     fn clear(&mut self, index: usize) {
         self.bits[index / 64] &= !(1 << (index % 64));
     }
@@ -149,21 +234,36 @@ static ALLOCATOR: Lock<Bitmap> = Lock::new(Bitmap::new());
 /// places below `__kernel_end`. It does not cover the device tree blob: QEMU
 /// puts that 128 MiB into RAM, nowhere near the image, and it is reserved
 /// separately once the header has been read and its real size is known.
-pub fn init() {
+pub fn init(base: u64, size: u64) {
+    // Truncation rather than refusal, so a machine with more RAM than the
+    // bitmap can track still boots on the part we can describe.
+    let size = size.min(MAX_RAM) / FRAME_SIZE * FRAME_SIZE;
+
+    RAM_BASE_ADDR.store(base, Ordering::Relaxed);
+    RAM_LENGTH.store(size, Ordering::Relaxed);
+
+    let frames = (size / FRAME_SIZE) as usize;
     let kernel_end = (&raw const __kernel_end) as u64;
 
     // Round up: a frame is only free if the whole frame is free.
     let first_free = kernel_end.div_ceil(FRAME_SIZE) * FRAME_SIZE;
-    let reserved_frames = ((first_free - RAM_BASE) / FRAME_SIZE) as usize;
+    let reserved_frames = ((first_free - base) / FRAME_SIZE) as usize;
 
     let mut allocator = ALLOCATOR.lock();
 
-    for index in 0..reserved_frames {
-        allocator.set(index);
-    }
+    allocator.set_range(0..reserved_frames);
+
+    // Everything past the end of RAM is marked taken rather than bounds
+    // checked on every allocation. The bitmap is sized for the largest machine
+    // we can track and this one is smaller, so the frames that do not exist
+    // have to look occupied or the lowest-first search will walk straight off
+    // the end of memory and hand out an address nothing answers to.
+    allocator.set_range(frames..MAX_FRAMES);
 
     allocator.reserved = reserved_frames;
-    allocator.free = FRAME_COUNT - reserved_frames;
+    allocator.free = frames - reserved_frames;
+
+    IMAGE_END.store(first_free, Ordering::Relaxed);
 }
 
 /// Why a range could not be reserved.
@@ -199,11 +299,11 @@ pub fn reserve_range(base: u64, len: u64) -> Result<usize, ReserveError> {
         .div_ceil(FRAME_SIZE)
         * FRAME_SIZE;
 
-    if start < RAM_BASE || end > RAM_BASE + RAM_SIZE {
+    if start < ram_base() || end > ram_base() + ram_size() {
         return Err(ReserveError::OutsideRam(base));
     }
 
-    let first = ((start - RAM_BASE) / FRAME_SIZE) as usize;
+    let first = ((start - ram_base()) / FRAME_SIZE) as usize;
     let count = ((end - start) / FRAME_SIZE) as usize;
 
     let mut allocator = ALLOCATOR.lock();
@@ -211,7 +311,7 @@ pub fn reserve_range(base: u64, len: u64) -> Result<usize, ReserveError> {
     for index in first..first + count {
         if allocator.is_set(index) {
             return Err(ReserveError::AlreadyTaken(
-                RAM_BASE + index as u64 * FRAME_SIZE,
+                ram_base() + index as u64 * FRAME_SIZE,
             ));
         }
     }
@@ -227,12 +327,57 @@ pub fn reserve_range(base: u64, len: u64) -> Result<usize, ReserveError> {
 
 /// Is this address in a frame that is allocated or reserved?
 pub fn is_taken(addr: u64) -> bool {
-    if !(RAM_BASE..RAM_BASE + RAM_SIZE).contains(&addr) {
+    if !(ram_base()..ram_base() + ram_size()).contains(&addr) {
         return false;
     }
     ALLOCATOR
         .lock()
-        .is_set(((addr - RAM_BASE) / FRAME_SIZE) as usize)
+        .is_set(((addr - ram_base()) / FRAME_SIZE) as usize)
+}
+
+/// Take on the real memory map, once the device tree has been read.
+///
+/// The allocator has to exist before the tree can be read (page tables are
+/// allocated, and reading the tree needs the MMU), so it starts on a guess and
+/// is corrected here. Growing means the frames past the guess stop being
+/// marked "does not exist"; shrinking means they start being.
+///
+/// Refuses to move RAM out from under itself. The base address is baked into
+/// every page table built so far and into every frame handed out, so a tree
+/// that disagrees about where RAM starts is a machine this boot path cannot
+/// serve. Saying so beats carrying on with two answers.
+pub fn adopt(base: u64, size: u64) -> Result<i64, ReserveError> {
+    if base != ram_base() {
+        return Err(ReserveError::OutsideRam(base));
+    }
+
+    let size = size.min(MAX_RAM) / FRAME_SIZE * FRAME_SIZE;
+    let old = frame_count();
+    let new = (size / FRAME_SIZE) as usize;
+
+    let mut allocator = ALLOCATOR.lock();
+
+    if new > old {
+        allocator.clear_range(old..new);
+        allocator.free += new - old;
+    } else {
+        // Shrinking can only take frames nobody has. Allocation is lowest
+        // first and this is the top of memory, so in practice nothing is up
+        // there; checking anyway, because "in practice" is how a frame ends up
+        // owned by two things.
+        for index in new..old {
+            if allocator.is_set(index) {
+                return Err(ReserveError::AlreadyTaken(
+                    ram_base() + index as u64 * FRAME_SIZE,
+                ));
+            }
+        }
+        allocator.set_range(new..old);
+        allocator.free -= old - new;
+    }
+
+    RAM_LENGTH.store(size, Ordering::Relaxed);
+    Ok(new as i64 - old as i64)
 }
 
 /// Take the lowest free frame, zeroed.
@@ -271,7 +416,7 @@ pub fn alloc_contiguous(count: usize) -> Option<Frame> {
     let mut run_start = 0;
     let mut run = 0;
 
-    for index in 0..FRAME_COUNT {
+    for index in 0..frame_count() {
         if allocator.is_set(index) {
             run = 0;
             continue;
@@ -317,7 +462,7 @@ pub fn free_contiguous(first: Frame, count: usize) {
 /// much later.
 pub fn free(frame: Frame) {
     assert!(
-        frame.addr() >= RAM_BASE && frame.addr() < RAM_BASE + RAM_SIZE,
+        frame.addr() >= ram_base() && frame.addr() < ram_base() + ram_size(),
         "freeing a frame outside RAM"
     );
     assert!(
@@ -349,27 +494,30 @@ pub fn reserved_frames() -> usize {
 pub fn print_map() {
     let reserved = reserved_frames();
     let free = free_frames();
-    let first_free = RAM_BASE + reserved as u64 * FRAME_SIZE;
+    let image_end = IMAGE_END.load(Ordering::Relaxed);
 
     println!(
         "memory: {} MiB at {:#x}, {} frames of {} KiB",
-        RAM_SIZE / 1024 / 1024,
-        RAM_BASE,
-        FRAME_COUNT,
+        ram_size() / 1024 / 1024,
+        ram_base(),
+        frame_count(),
         FRAME_SIZE / 1024
     );
     println!(
-        "  reserved : {:#012x}..{:#012x}  {:>4} KiB  kernel image",
-        RAM_BASE,
-        first_free,
+        "  kernel   : {:#012x}..{:#012x}  {:>4} KiB",
+        ram_base(),
+        image_end,
+        (image_end - ram_base()) / 1024
+    );
+    println!(
+        "  reserved : {:>6} frames  {:>4} KiB  image and anything the machine claimed",
+        reserved,
         reserved as u64 * FRAME_SIZE / 1024
     );
     println!(
-        "  free     : {:#012x}..{:#012x}  {:>4} MiB  {} frames",
-        first_free,
-        RAM_BASE + RAM_SIZE,
-        free as u64 * FRAME_SIZE / 1024 / 1024,
-        free
+        "  free     : {:>6} frames  {:>4} MiB",
+        free,
+        free as u64 * FRAME_SIZE / 1024 / 1024
     );
 }
 
@@ -443,6 +591,32 @@ pub fn self_test() {
     assert!(!is_taken(low.addr()), "a refused reservation kept a frame");
 
     free(high);
+
+    // The top of RAM has to be reachable through the physical map. The map is
+    // built before the device tree can be read, so it covers whatever the
+    // kernel guessed at, and a machine with more memory than that has frames
+    // the allocator will hand out and the kernel cannot touch. Nothing else in
+    // the boot path allocates high enough to notice.
+    let last = ram_base() + ram_size() - FRAME_SIZE;
+    assert!(!is_taken(last), "the top of RAM is spoken for");
+    let ptr = crate::paging::phys_to_virt(last) as *mut u64;
+    unsafe {
+        ptr.write_volatile(0x7261_636b);
+        assert_eq!(
+            ptr.read_volatile(),
+            0x7261_636b,
+            "the last frame in RAM is not mapped"
+        );
+        ptr.write_volatile(0);
+    }
+
+    // Moving RAM out from under the allocator is refused. Every page table
+    // built so far and every frame handed out is relative to the old base, so
+    // a tree that disagrees is a machine this boot path cannot serve.
+    assert_eq!(
+        adopt(ram_base() + FRAME_SIZE, ram_size()),
+        Err(ReserveError::OutsideRam(ram_base() + FRAME_SIZE))
+    );
 
     // A range outside RAM is a bad address, not an empty reservation.
     assert_eq!(

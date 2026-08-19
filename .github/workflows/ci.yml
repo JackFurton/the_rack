@@ -34,6 +34,12 @@ jobs:
       - name: Boot under QEMU
         run: scripts/boot-test.sh
 
+      # The memory map comes from the device tree now, so the only proof it is
+      # not a constant in disguise is booting at a size the kernel was never
+      # built against.
+      - name: Boot with a different amount of RAM
+        run: MEMORY=512M scripts/boot-test.sh
+
   lint:
     name: fmt and clippy
     runs-on: ubuntu-latest
