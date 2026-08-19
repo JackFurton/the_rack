@@ -18,6 +18,7 @@ pub mod syscall;
 pub mod tasks;
 pub mod timer;
 pub mod uart;
+pub mod virtio;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -133,6 +134,9 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
             fdt::print_info(&blob);
             adopt_memory_map(&blob);
             discover_devices(&blob);
+            let (slots, occupied) = virtio::discover(&blob);
+            println!();
+            virtio::print_table(slots, occupied);
         }
         Err(error) => {
             println!(
@@ -149,6 +153,7 @@ extern "C" fn kernel_main_high(dtb: u64) -> ! {
     exceptions::self_test();
     fdt::self_test();
     fdt::tree_self_test();
+    virtio::self_test();
     sync::self_test();
     frames::self_test();
     paging::self_test();

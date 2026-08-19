@@ -53,16 +53,20 @@ device tree:
   console       : 0x0009000000 + 0x1000, where we were already talking
   interrupts    : dist 0x0008000000 cpu 0x0008010000, as assumed
 
+virtio: 32 mmio slots, 1 occupied
+  0x000a003e00 : block device, intid 79, offers 0x10130006e54
+
 memory: 256 MiB at 0x40000000, 65536 frames of 4 KiB
-  kernel   : 0x0040000000..0x00400ee000   952 KiB
-  reserved :    494 frames  1976 KiB  image and anything the machine claimed
-  free     :  65032 frames   254 MiB
+  kernel   : 0x0040000000..0x00400f4000   976 KiB
+  reserved :    500 frames  2000 KiB  image and anything the machine claimed
+  free     :  65025 frames   254 MiB
 
 trap self test: resumed, registers intact
 lock self test: passed, guarded counter reached 1
 frame self test: passed, reuse of 0x400f8000 came back clean, 65032 frames free
 fdt self test: passed, a good header parses and ten broken ones are refused
 device tree self test: passed, this machine is a linux,dummy-virt with 256 MiB at 0x40000000
+virtio self test: passed, 1 device agreed on features and was reset
 paging self test: passed, running at 0xffff000040084a94
   write to .text   : permission fault
   write to .rodata : permission fault
@@ -635,6 +639,35 @@ window is mapped in 2 MiB blocks, and mapping a 4 KiB page inside one would
 walk into a block descriptor as though it were a table pointer. Devices found
 outside it, which is where the virtio transports live, get mapped properly.
 
+**Why an empty virtio slot is not a failure.** `virt` puts 32 transport windows
+in the device tree whether or not anything is plugged into them, and each one
+answers with the right magic and version and a device id of zero. That is the
+machine saying it reserved an address for a device nobody attached, and
+treating it as an error would mean 31 errors on every boot of a machine with
+one disk.
+
+**Why the driver reads `FEATURES_OK` back after writing it.** The bit is how
+the device answers, not how the driver asserts. A device that cannot work with
+what was offered clears it, and a driver that writes the bit and carries on is
+configuring a device that has already given up. Same shape as the rest of the
+status register: the driver writes what it has done, the device writes what it
+thinks of it.
+
+**Why the device tree numbers interrupts differently from the controller.** A
+`virtio,mmio` node says `interrupts = <0 0x10 1>`, which is SPI number 16. The
+GIC calls that interrupt 48, because its first 32 ids belong to software
+generated and per-core interrupts. Skip the offset and you ask the controller
+to enable somebody else's line and then wait forever for your own, which looks
+exactly like a device that never raises an interrupt.
+
+**Why the legacy virtio interface is refused rather than supported.** Version 1
+puts a page size in the transport, addresses queues by page number instead of
+by address, and lays out half the registers differently. It is a second path
+through every driver, for hardware this kernel will not meet. QEMU's `virt`
+machine defaults to legacy for compatibility, so the runner passes
+`-global virtio-mmio.force-legacy=false` and the kernel refuses anything that
+still reports version 1.
+
 ## Layout
 
 ```
@@ -654,6 +687,7 @@ kernel/
     paging.rs     page tables, permissions, the move to the high half
     switch.S      the callee-saved swap that changes which task is running
     tasks.rs      kernel tasks, scheduling, address spaces, EL0 entry
+    virtio.rs     virtio-mmio transports: discovery and the feature handshake
     syscall.rs    the SVC interface and its argument checking
     user.S        the program that runs at EL0
     timer.rs      generic timer, the 100 Hz heartbeat
