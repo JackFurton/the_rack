@@ -12,12 +12,8 @@ target = "aarch64-unknown-none-softfloat"
 [target.aarch64-unknown-none-softfloat]
 # `cargo run` boots the kernel on the QEMU virt machine and wires its UART to
 # this terminal. Ctrl-A then X quits.
-runner = [
-    "qemu-system-aarch64",
-    "-machine", "virt",
-    "-cpu", "cortex-a72",
-    "-m", "256M",
-    "-nographic",
-    "-semihosting-config", "enable=on,target=native",
-    "-kernel",
-]
+#
+# A script rather than a bare QEMU command line, because QEMU has to be handed
+# a flat image and cargo hands the runner an ELF. `scripts/image.sh` explains
+# why the difference matters: only the flat image gets a device tree.
+runner = "scripts/qemu-run.sh"

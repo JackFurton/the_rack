@@ -437,13 +437,19 @@ pub unsafe fn enable(ttbr0: Frame, ttbr1: Frame) {
     }
 }
 
-/// Move execution to the high half and continue at `continuation`.
+/// Move execution to the high half and continue at `continuation`, passing it
+/// `arg`.
+///
+/// The argument exists because the device tree pointer has to survive the jump
+/// and there is nowhere else to put it: a static written before this point was
+/// written through a low address, and the whole point of the jump is that low
+/// addresses stop meaning anything.
 ///
 /// # Safety
 ///
 /// The MMU must be on with a high half mapping of the kernel already in
 /// `TTBR1_EL1`, and the current stack must have a high alias.
-pub unsafe fn jump_to_high_half(continuation: extern "C" fn() -> !) -> ! {
+pub unsafe fn jump_to_high_half(continuation: extern "C" fn(u64) -> !, arg: u64) -> ! {
     let target = continuation as usize as u64 + KERNEL_BASE;
 
     unsafe {
@@ -457,6 +463,8 @@ pub unsafe fn jump_to_high_half(continuation: extern "C" fn() -> !) -> ! {
             "br {target}",
             offset = in(reg) KERNEL_BASE,
             target = in(reg) target,
+            // Placed by name, since the continuation reads it as an argument.
+            in("x0") arg,
             options(noreturn),
         );
     }

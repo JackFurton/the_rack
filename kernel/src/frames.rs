@@ -145,10 +145,10 @@ static ALLOCATOR: Lock<Bitmap> = Lock::new(Bitmap::new());
 /// Claim everything from `RAM_BASE` up to the end of the kernel image, and
 /// release the rest.
 ///
-/// The reserved region covers two things that must never be handed out: the
-/// device tree blob QEMU places at the base of RAM, and the kernel image
-/// itself including the boot stack, which `linker.ld` places below
-/// `__kernel_end`.
+/// That covers the kernel image including the boot stack, which `linker.ld`
+/// places below `__kernel_end`. It does not cover the device tree blob: QEMU
+/// puts that 128 MiB into RAM, nowhere near the image, and it is reserved
+/// separately once the header has been read and its real size is known.
 pub fn init() {
     let kernel_end = (&raw const __kernel_end) as u64;
 
@@ -164,6 +164,75 @@ pub fn init() {
 
     allocator.reserved = reserved_frames;
     allocator.free = FRAME_COUNT - reserved_frames;
+}
+
+/// Why a range could not be reserved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReserveError {
+    /// The range is not entirely inside RAM.
+    OutsideRam(u64),
+    /// A frame in the range has already been handed out, so reserving it now
+    /// would mean two owners.
+    AlreadyTaken(u64),
+}
+
+/// Claim a range of physical memory the allocator must never hand out.
+///
+/// Needed for memory that belongs to somebody else and happens to sit in RAM:
+/// the device tree blob, and later whatever `/reserved-memory` describes. The
+/// kernel image is not reserved this way, because `init` already has it.
+///
+/// Checks the whole range before setting a single bit. A partial reservation
+/// would be worse than none: the caller sees a failure and assumes nothing
+/// happened, while some of the range has quietly left the pool for good.
+pub fn reserve_range(base: u64, len: u64) -> Result<usize, ReserveError> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    // Round outwards. A frame is only safe to hand out if none of it is
+    // spoken for, so a range covering one byte of a frame reserves the frame.
+    let start = base / FRAME_SIZE * FRAME_SIZE;
+    let end = base
+        .checked_add(len)
+        .ok_or(ReserveError::OutsideRam(base))?
+        .div_ceil(FRAME_SIZE)
+        * FRAME_SIZE;
+
+    if start < RAM_BASE || end > RAM_BASE + RAM_SIZE {
+        return Err(ReserveError::OutsideRam(base));
+    }
+
+    let first = ((start - RAM_BASE) / FRAME_SIZE) as usize;
+    let count = ((end - start) / FRAME_SIZE) as usize;
+
+    let mut allocator = ALLOCATOR.lock();
+
+    for index in first..first + count {
+        if allocator.is_set(index) {
+            return Err(ReserveError::AlreadyTaken(
+                RAM_BASE + index as u64 * FRAME_SIZE,
+            ));
+        }
+    }
+
+    for index in first..first + count {
+        allocator.set(index);
+    }
+    allocator.reserved += count;
+    allocator.free -= count;
+
+    Ok(count)
+}
+
+/// Is this address in a frame that is allocated or reserved?
+pub fn is_taken(addr: u64) -> bool {
+    if !(RAM_BASE..RAM_BASE + RAM_SIZE).contains(&addr) {
+        return false;
+    }
+    ALLOCATOR
+        .lock()
+        .is_set(((addr - RAM_BASE) / FRAME_SIZE) as usize)
 }
 
 /// Take the lowest free frame, zeroed.
@@ -270,7 +339,8 @@ pub fn free_frames() -> usize {
     ALLOCATOR.lock().free
 }
 
-/// Frames permanently held by the kernel image and the device tree blob.
+/// Frames permanently held: the kernel image, and anything `reserve_range`
+/// has taken out of the pool since.
 pub fn reserved_frames() -> usize {
     ALLOCATOR.lock().reserved
 }
@@ -289,7 +359,7 @@ pub fn print_map() {
         FRAME_SIZE / 1024
     );
     println!(
-        "  reserved : {:#012x}..{:#012x}  {:>4} KiB  kernel image and DTB",
+        "  reserved : {:#012x}..{:#012x}  {:>4} KiB  kernel image",
         RAM_BASE,
         first_free,
         reserved as u64 * FRAME_SIZE / 1024
@@ -345,6 +415,40 @@ pub fn self_test() {
         "reused frame still held the previous owner's data"
     );
     free(reused);
+
+    assert_eq!(free_frames(), before);
+
+    // Reserving a range that includes a frame already handed out has to fail,
+    // and has to fail without taking the rest of the range with it. The range
+    // below starts on a free frame and ends on an allocated one, so a
+    // reservation that set bits as it went would leave the first frame gone
+    // and report an error at the same time.
+    let low = alloc().expect("allocator had no frames");
+    let high = alloc().expect("allocator had no frames");
+    free(low);
+
+    let free_before = free_frames();
+    let reserved_before = reserved_frames();
+    assert_eq!(
+        reserve_range(low.addr(), FRAME_SIZE * 2),
+        Err(ReserveError::AlreadyTaken(high.addr())),
+        "reserving over an allocated frame must be refused"
+    );
+    assert_eq!(
+        free_frames(),
+        free_before,
+        "a refused reservation took frames anyway"
+    );
+    assert_eq!(reserved_frames(), reserved_before);
+    assert!(!is_taken(low.addr()), "a refused reservation kept a frame");
+
+    free(high);
+
+    // A range outside RAM is a bad address, not an empty reservation.
+    assert_eq!(
+        reserve_range(0x1000, FRAME_SIZE),
+        Err(ReserveError::OutsideRam(0x1000))
+    );
 
     assert_eq!(free_frames(), before);
 

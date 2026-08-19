@@ -6,6 +6,7 @@
 #![no_main]
 
 pub mod exceptions;
+pub mod fdt;
 pub mod frames;
 pub mod gic;
 pub mod ipc;
@@ -31,6 +32,11 @@ unsafe extern "C" {
 
 /// Called by `boot.S` once core 0 has a stack and a zeroed BSS.
 ///
+/// `dtb` is the physical address of the device tree blob, straight from the x0
+/// the firmware entered with. Nothing is done with it here: reading it means
+/// reading memory, and the only sane way to say where memory is happens after
+/// the MMU is on. It is carried across the jump and looked at there.
+///
 /// Runs at physical addresses with the MMU off, and is deliberately tiny.
 ///
 /// Nothing here may use `println!`. The kernel is linked at its high half
@@ -40,7 +46,7 @@ unsafe extern "C" {
 ///
 /// The job is to get the MMU on and get out.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn kernel_main(dtb: u64) -> ! {
     uart::emergency_print("\nthe_rack: booting, mmu off\n");
 
     // PC relative addressing means the linker symbols this reads resolve to
@@ -57,7 +63,7 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { paging::enable(ttbr0, ttbr1) };
     uart::emergency_print("the_rack: mmu on, jumping to the high half\n");
 
-    unsafe { paging::jump_to_high_half(kernel_main_high) }
+    unsafe { paging::jump_to_high_half(kernel_main_high, dtb) }
 }
 
 /// Everything from here runs at a high half virtual address.
@@ -65,7 +71,7 @@ pub extern "C" fn kernel_main() -> ! {
 /// Separate function because the jump is a branch to a computed address, not a
 /// call: there is no return path to the low half, and the low half is about to
 /// stop existing.
-extern "C" fn kernel_main_high() -> ! {
+extern "C" fn kernel_main_high(dtb: u64) -> ! {
     // Nothing may touch a device register or a frame before this: the physical
     // addresses they hold are no longer the addresses that work.
     unsafe { paging::finish_high_half() };
@@ -94,7 +100,26 @@ extern "C" fn kernel_main_high() -> ! {
     frames::print_map();
     println!();
 
+    // The first thing this kernel has been told rather than told itself.
+    // Nothing depends on it yet: every address it would supply is still a
+    // constant, and will be until #42 and #43. Getting it validated and
+    // printed first means the rest of tier 4 starts from something known good.
+    match fdt::init(dtb) {
+        Ok(blob) => {
+            fdt::print_info(&blob);
+            reserve_blob(&blob);
+        }
+        Err(error) => {
+            println!(
+                "device tree: none ({}), carrying on with constants",
+                error.describe()
+            );
+        }
+    }
+    println!();
+
     exceptions::self_test();
+    fdt::self_test();
     sync::self_test();
     frames::self_test();
     paging::self_test();
@@ -154,9 +179,39 @@ extern "C" fn kernel_main_high() -> ! {
     // kernel's part in a tick is re-arming the deadline and setting one bit.
     tasks::spawn_heartbeat();
     println!("tier 3: notifications online, heartbeat now runs at EL0.");
+    println!("tier 4: the machine describes itself, device tree in hand.");
     println!();
 
     halt()
+}
+
+/// Keep the allocator's hands off the device tree.
+///
+/// QEMU does not put the blob at the base of RAM, which is what this project
+/// assumed until it could actually see one: on `virt` it lands 128 MiB up,
+/// well past the kernel image and squarely inside the pool. Nothing has read
+/// the tree yet, so the corruption would have been invisible until #41 tried
+/// to walk it and found somebody's page table in the middle.
+///
+/// A failure here is a warning rather than a panic. The tree is not load
+/// bearing yet, and a kernel that boots and complains is more useful than one
+/// that dies over memory it is not using.
+fn reserve_blob(blob: &fdt::Blob) {
+    let size = blob.header.totalsize as u64;
+
+    match frames::reserve_range(blob.pa, size) {
+        Ok(count) => {
+            assert!(frames::is_taken(blob.pa), "the first frame is not held");
+            assert!(
+                frames::is_taken(blob.pa + size - 1),
+                "the last frame is not held"
+            );
+            println!("  reserved      : {} frames", count);
+        }
+        Err(error) => {
+            println!("  WARNING       : could not reserve the blob ({:?})", error);
+        }
+    }
 }
 
 /// Which privilege level did the firmware drop us into?

@@ -17,8 +17,11 @@
  * longer translates. Link it high and they are right from the start, at the
  * cost that nothing before the MMU comes on may use them.
  *
- * RAM starts at 0x4000_0000. QEMU drops the device tree blob at the base of
- * RAM, so the kernel loads 512 KiB up to leave it alone.
+ * RAM starts at 0x4000_0000 and the kernel loads 512 KiB up, at 0x4008_0000.
+ * That is not an arbitrary gap: it is where the Linux arm64 boot protocol says
+ * a flat image goes, which is exactly where QEMU puts one. Booting the flat
+ * image rather than the ELF is what gets us a device tree at all, so the load
+ * address and the boot protocol have to agree.
  *
  * Every section boundary is 4 KiB aligned. Permissions are per page, so a
  * boundary falling mid page would force that page to carry the weaker of two
